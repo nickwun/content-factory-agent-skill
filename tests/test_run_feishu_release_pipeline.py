@@ -79,6 +79,36 @@ class RunFeishuReleasePipelineTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "04-Outputs"
         self.root.mkdir(parents=True)
+        self.publish_log = Path(self.tmp.name) / "publish-log.jsonl"
+        self.publisher = Path(self.tmp.name) / "fake-publisher.py"
+        self.publisher.write_text(
+            f"""#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+log = Path({str(self.publish_log)!r})
+with log.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"slug": out.name}}, ensure_ascii=False) + "\\n")
+meta = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+doc = "DOC_" + out.name.replace("-", "_")
+meta.setdefault("publish", {{}}).setdefault("feishu", {{}}).update({{
+    "status": "published",
+    "documentId": doc,
+    "documentUrl": "https://feishu.cn/docx/" + doc,
+    "backend": "feishu-cli",
+    "publishedAt": "2026-06-19T00:00:00Z",
+    "permission": {{"status": "skipped", "grantedTo": "", "perm": "edit"}},
+}})
+(out / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+image_result = "0/1" if "bad-image" in out.name else "1/1"
+(out / "publish-report.md").write_text("# Report\\n\\n- image upload result：`" + image_result + "`\\n", encoding="utf-8")
+print(json.dumps({{"status": "published", "documentUrl": meta["publish"]["feishu"]["documentUrl"]}}, ensure_ascii=False))
+""",
+            encoding="utf-8",
+        )
+        self.publisher.chmod(0o755)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -166,6 +196,67 @@ class RunFeishuReleasePipelineTest(unittest.TestCase):
             text=True,
             env=env,
         )
+
+    def write_guarded_run(
+        self,
+        run_id: str,
+        outputs: list[Path],
+        *,
+        dry_run_passed: bool = True,
+        include_outputs: bool = True,
+        extra_prepared: list[dict] | None = None,
+    ) -> Path:
+        run_dir = self.root / "batch-runs" / run_id
+        run_dir.mkdir(parents=True)
+        prepared = []
+        if include_outputs:
+            prepared = [{"slug": output.name, "outputDir": str(output), "status": "exists"} for output in outputs]
+            for output in outputs:
+                feishu_publish = output / "feishu-publish.md"
+                if not feishu_publish.exists():
+                    feishu_publish.write_text("# Feishu\n\n![封面图](images/cover.png)\n", encoding="utf-8")
+                metadata_path = output / "metadata.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                feishu = metadata.setdefault("publish", {}).setdefault("feishu", {})
+                if feishu.get("status") != "published":
+                    feishu["status"] = "prepared"
+                    feishu["markdownFile"] = "feishu-publish.md"
+                metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        if extra_prepared:
+            prepared.extend(extra_prepared)
+        batch_result = {
+            "selectedCount": len(outputs) if dry_run_passed and include_outputs else 0,
+            "statePath": str(self.root / "batch-runs" / f"{run_id}-batch-dry-run" / "run_state.json"),
+            "summaryPath": str(self.root / "batch-runs" / "2026-06-19-feishu-publish-batch-test.md"),
+            "results": [
+                {
+                    "outputDir": str(output),
+                    "status": "dry_run" if dry_run_passed else "failed",
+                    "imageUploadResult": "",
+                    "skippedReason": "",
+                    "error": "" if dry_run_passed else "dry run failed",
+                }
+                for output in outputs
+            ],
+        }
+        state = {
+            "run_id": run_id,
+            "mode": "guarded",
+            "prepared": prepared,
+            "skipped": [],
+            "risks": [],
+            "batchDryRun": batch_result,
+            "guardedPublishCommand": "preview",
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        (run_dir / "summary.md").write_text("# Summary\n", encoding="utf-8")
+        (run_dir / "backup_manifest.json").write_text(json.dumps({"files": []}, ensure_ascii=False), encoding="utf-8")
+        return run_dir
+
+    def publisher_log_slugs(self) -> list[str]:
+        if not self.publish_log.exists():
+            return []
+        return [json.loads(line)["slug"] for line in self.publish_log.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def diagnostic_for(self, payload: dict, slug: str) -> dict:
         for item in payload["allUnpublishedDiagnostics"]:
@@ -401,6 +492,218 @@ class RunFeishuReleasePipelineTest(unittest.TestCase):
         self.assertIn("--allow-permission-skip", payload["guardedPublishCommand"])
         metadata = json.loads((ready / "metadata.json").read_text(encoding="utf-8"))
         self.assertNotEqual(metadata["publish"]["feishu"].get("status"), "published")
+
+    def test_execute_requires_confirm_run_id(self) -> None:
+        result = self.run_script("--mode", "execute", "--allow-permission-skip", "--publisher", str(self.publisher))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--confirm-run-id", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+
+    def test_execute_fails_when_guarded_run_missing(self) -> None:
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "missing-guarded-run",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("guarded run not found", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+
+    def test_execute_fails_when_guarded_dry_run_did_not_pass(self) -> None:
+        output = self.write_output("2026-06-19-ready")
+        self.write_guarded_run("guarded-failed", [output], dry_run_passed=False)
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-failed",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dry-run did not pass", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+
+    def test_execute_fails_when_guarded_run_has_no_explicit_output_dirs(self) -> None:
+        self.write_guarded_run("guarded-empty", [], include_outputs=False)
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-empty",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no explicit output dirs", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+
+    def test_execute_does_not_rescan_and_preserves_guarded_order(self) -> None:
+        extra = self.write_output("2026-06-19-aaa-extra")
+        second = self.write_output("2026-06-19-second")
+        first = self.write_output("2026-06-19-first")
+        self.write_guarded_run("guarded-order", [second, first])
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-order",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["mode"], "execute")
+        self.assertEqual(payload["selectedCount"], 2)
+        self.assertEqual(
+            [Path(item).resolve() for item in payload["execute"]["selectedOutputDirs"]],
+            [second.resolve(), first.resolve()],
+        )
+        self.assertEqual(self.publisher_log_slugs(), [second.name, first.name])
+        extra_meta = json.loads((extra / "metadata.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(extra_meta["publish"]["feishu"]["status"], "published")
+
+    def test_execute_preflight_rejects_published_output_without_calling_publisher(self) -> None:
+        output = self.write_output("2026-06-19-already-published", published=True)
+        self.write_guarded_run("guarded-published", [output])
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-published",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already published", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+
+    def test_execute_preflight_rejects_missing_feishu_publish_without_calling_publisher(self) -> None:
+        output = self.write_output("2026-06-19-missing-feishu")
+        self.write_guarded_run("guarded-missing-feishu", [output])
+        (output / "feishu-publish.md").unlink(missing_ok=True)
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-missing-feishu",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing feishu-publish.md", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+
+    def test_execute_preflight_rejects_requires_remote_check_without_calling_publisher(self) -> None:
+        output = self.write_output("2026-06-19-remote-check", requires_remote_check=True)
+        self.write_guarded_run("guarded-remote-check", [output])
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-remote-check",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requiresRemoteCheck", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+
+    def test_execute_fails_fast_without_owner_or_permission_skip(self) -> None:
+        output = self.write_output("2026-06-19-ready")
+        self.write_guarded_run("guarded-owner", [output])
+        env = os.environ.copy()
+        for key in ["FEISHU_OWNER_USER_ID", "FEISHU_OWNER_EMAIL", "FEISHU_OWNER_OPEN_ID", "FEISHU_OWNER_UNION_ID"]:
+            env.pop(key, None)
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-owner",
+            "--publisher",
+            str(self.publisher),
+            env=env,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FEISHU_OWNER", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+
+    def test_execute_success_uses_fake_publisher_and_writes_execute_state(self) -> None:
+        first = self.write_output("2026-06-19-first")
+        second = self.write_output("2026-06-19-second")
+        self.write_guarded_run("guarded-success", [first, second])
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-success",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["execute"]["status"], "published")
+        self.assertEqual(payload["execute"]["batchResult"]["selectedCount"], 2)
+        self.assertEqual([item["status"] for item in payload["execute"]["batchResult"]["results"]], ["published", "published"])
+        self.assertTrue(Path(payload["paths"]["runState"]).exists())
+        self.assertTrue(Path(payload["paths"]["summary"]).exists())
+        self.assertTrue(Path(payload["paths"]["backupManifest"]).exists())
+        self.assertTrue(Path(payload["execute"]["postBackupManifestPath"]).exists())
+        self.assertEqual(self.publisher_log_slugs(), [first.name, second.name])
+
+    def test_execute_image_upload_failure_marks_repair_required_and_stops_later_outputs(self) -> None:
+        bad = self.write_output("2026-06-19-bad-image")
+        later = self.write_output("2026-06-19-later")
+        self.write_guarded_run("guarded-repair", [bad, later])
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-repair",
+            "--allow-permission-skip",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["execute"]["status"], "repair_required")
+        results = payload["execute"]["batchResult"]["results"]
+        self.assertEqual(results[0]["imageUploadResult"], "0/1")
+        self.assertEqual(results[1]["status"], "not_started_after_failure")
+        self.assertEqual(self.publisher_log_slugs(), [bad.name])
+        later_meta = json.loads((later / "metadata.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(later_meta["publish"]["feishu"]["status"], "published")
 
 
 if __name__ == "__main__":

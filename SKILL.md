@@ -520,7 +520,7 @@ Batch rules:
 
 ## Guarded Feishu Release Pipeline
 
-Use this to orchestrate existing `04-Outputs` articles before a Feishu batch release. Version 1 never executes a real publish command; real publishing must remain a separate explicit command until a future `--execute` milestone exists.
+Use this to orchestrate existing `04-Outputs` articles before a Feishu batch release. The default flow stops at `guarded`; real publishing is only allowed through `execute`, and `execute` must confirm a completed guarded run.
 
 ```bash
 python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_feishu_release_pipeline.py \
@@ -534,6 +534,30 @@ Modes:
 - `inspect`: scan only. It must not modify the vault, run quality checks, build `feishu-publish.md`, write run state, write summary files, or call Feishu.
 - `prepare`: local preparation is allowed. It may run quality checks, build `feishu-publish.md`, and write run state, summary, Codex task notes, and backup manifests. It must not call real Feishu publish or upload images.
 - `guarded`: includes `prepare`, then calls `publish_feishu_batch.py --dry-run` with explicit `--output-dir` arguments and prints the real publish command preview. It must not execute that command.
+- `execute`: the only total-pipeline mode allowed to perform real Feishu publishing. It must read a completed guarded run and publish exactly the guarded run's explicit output dirs in the same order.
+
+Execute mode:
+
+```bash
+python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_feishu_release_pipeline.py \
+  --root /Users/hui/Documents/ContentFactoryVault/04-Outputs \
+  --mode execute \
+  --confirm-run-id guarded-run-id \
+  --allow-permission-skip
+```
+
+Execute rules:
+
+- `--confirm-run-id` is required. The run must exist under `batch-runs/<confirm-run-id>/`.
+- `execute` must read `run_state.json`, `summary.md`, and `backup_manifest.json` from the guarded run.
+- `execute` must not rescan `--root` or use `--count` to select articles.
+- `execute` may only publish output dirs recorded by the guarded run, in guarded order.
+- The guarded run must have passed batch dry-run with explicit output dirs; skipped, failed, blocked, risky, or `requiresRemoteCheck` selected items must fail before publisher invocation.
+- Before publishing, each output must still have `publish.feishu.status = prepared`, no `documentUrl`, no `documentId`, no `requiresRemoteCheck`, `quality.status = ready_for_edit`, complete title state, `feishu-publish.md`, and `images/cover.png`.
+- If no `FEISHU_OWNER_*` is configured, `execute` must fail unless `--allow-permission-skip` is explicit.
+- `execute` calls `publish_feishu_batch.py` with explicit `--output-dir` arguments and `--run-id <confirm-run-id>-execute`; it must not add `--check-blocks`.
+- If any article returns `imageUploadResult != 1/1`, the run is `repair_required`, later explicit outputs are not started, and manual repair/reconciliation is required. The pipeline must not auto-repair.
+- Because ContentFactoryVault may not be a Git repo, `execute` records pre-execute and post-execute backup manifests plus run state and summary.
 
 Candidate rules:
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -25,8 +26,10 @@ DEFAULT_ROOT = Path("/Users/hui/Documents/ContentFactoryVault/04-Outputs")
 QUALITY_SCRIPT = SCRIPT_DIR / "quality_check_output.py"
 BUILD_SCRIPT = SCRIPT_DIR / "build_feishu_publish_markdown.py"
 BATCH_SCRIPT = SCRIPT_DIR / "publish_feishu_batch.py"
+DEFAULT_LOCK_PATH = Path("/Users/hui/Documents/distributing-web/.codex_locks/feishu_publish.lock")
 RISK_KEYWORDS = ("heart-risk", "liver", "drinking", "red-flags")
 READY_QUALITY_STATUSES = {"ready_for_edit", "ready", "publish_ready", "ready_to_publish"}
+OWNER_ENV_KEYS = ("FEISHU_OWNER_USER_ID", "FEISHU_OWNER_OPEN_ID", "FEISHU_OWNER_UNION_ID", "FEISHU_OWNER_EMAIL")
 
 
 class ReleasePipelineError(RuntimeError):
@@ -339,9 +342,18 @@ def hash_file(path: Path) -> dict[str, Any]:
     return {"path": str(path), "size": path.stat().st_size, "sha256": h.hexdigest()}
 
 
-def write_backup_manifest(run_dir: Path, outputs: list[Path]) -> Path:
+def write_backup_manifest(
+    run_dir: Path,
+    outputs: list[Path],
+    *,
+    filename: str = "backup_manifest.json",
+    include_publish_report: bool = False,
+    extra_files: list[Path] | None = None,
+) -> Path:
     files: list[dict[str, Any]] = []
     names = ["metadata.json", "article.md", "titles.md", "quality-report.md", "feishu-publish.md"]
+    if include_publish_report:
+        names.append("publish-report.md")
     for output in outputs:
         for name in names:
             path = output / name
@@ -350,9 +362,54 @@ def write_backup_manifest(run_dir: Path, outputs: list[Path]) -> Path:
         cover = output / "images" / "cover.png"
         if cover.is_file():
             files.append(hash_file(cover))
+    for path in extra_files or []:
+        if path.is_file():
+            files.append(hash_file(path))
     manifest = {"createdAt": utc_now(), "files": files}
-    path = run_dir / "backup_manifest.json"
+    path = run_dir / filename
     write_json(path, manifest)
+    return path
+
+
+def write_execute_summary(run_dir: Path, payload: dict[str, Any]) -> Path:
+    execute = payload.get("execute") if isinstance(payload.get("execute"), dict) else {}
+    batch_result = execute.get("batchResult") if isinstance(execute.get("batchResult"), dict) else {}
+    path = run_dir / "summary.md"
+    lines = [
+        "---",
+        "type: feishu_release_pipeline_execute_summary",
+        f"created_at: {utc_now()}",
+        f"run_id: {payload['runId']}",
+        f"guarded_run_id: {execute.get('guardedRunId', '')}",
+        "---",
+        "",
+        "# Feishu Release Execute Summary",
+        "",
+        f"- mode: `{payload['mode']}`",
+        f"- guardedRunId: `{execute.get('guardedRunId', '')}`",
+        f"- executeRunId: `{execute.get('executeRunId', '')}`",
+        f"- status: `{execute.get('status', '')}`",
+        f"- selectedCount: `{payload['selectedCount']}`",
+        "",
+        "## Output Dirs",
+        "",
+    ]
+    for output in execute.get("selectedOutputDirs", []):
+        lines.append(f"- `{output}`")
+    lines.extend(["", "## Batch Result", ""])
+    lines.append(f"- statePath: `{batch_result.get('statePath', '')}`")
+    lines.append(f"- summaryPath: `{batch_result.get('summaryPath', '')}`")
+    for item in batch_result.get("results", []):
+        lines.append(
+            f"- `{Path(str(item.get('outputDir') or '')).name}`: "
+            f"status=`{item.get('status', '')}`, image=`{item.get('imageUploadResult', '')}`, "
+            f"document=`{item.get('documentUrl', '')}`"
+        )
+    lines.extend(["", "## Backup", ""])
+    lines.append(f"- preExecuteBackupManifest: `{execute.get('preBackupManifestPath', '')}`")
+    lines.append(f"- postExecuteBackupManifest: `{execute.get('postBackupManifestPath', '')}`")
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
     return path
 
 
@@ -473,7 +530,189 @@ def guarded_command(root: Path, outputs: list[Path], run_id: str, allow_permissi
     return " ".join(shlex.quote(part) for part in parts)
 
 
+def has_owner_env() -> bool:
+    return any(os.environ.get(key) for key in OWNER_ENV_KEYS)
+
+
+def load_guarded_run(root: Path, confirm_run_id: str) -> tuple[Path, dict[str, Any], list[Path]]:
+    if not confirm_run_id:
+        raise ReleasePipelineError("--confirm-run-id is required for execute mode")
+    run_dir = root / "batch-runs" / confirm_run_id
+    state_path = run_dir / "run_state.json"
+    summary_path = run_dir / "summary.md"
+    backup_path = run_dir / "backup_manifest.json"
+    missing = [str(path) for path in [state_path, summary_path, backup_path] if not path.is_file()]
+    if missing:
+        raise ReleasePipelineError(f"guarded run not found or incomplete: {confirm_run_id}; missing: {', '.join(missing)}")
+    state = load_json(state_path)
+    if state.get("mode") != "guarded":
+        raise ReleasePipelineError(f"confirm run is not a guarded run: {confirm_run_id}")
+    prepared = state.get("prepared") if isinstance(state.get("prepared"), list) else []
+    outputs: list[Path] = []
+    for item in prepared:
+        if not isinstance(item, dict) or not item.get("outputDir"):
+            continue
+        outputs.append(Path(str(item["outputDir"])).expanduser().resolve())
+    if not outputs:
+        raise ReleasePipelineError("guarded run has no explicit output dirs")
+    if len({str(path) for path in outputs}) != len(outputs):
+        raise ReleasePipelineError("guarded run contains duplicate output dirs")
+
+    batch_result = state.get("batchDryRun") if isinstance(state.get("batchDryRun"), dict) else {}
+    results = batch_result.get("results") if isinstance(batch_result.get("results"), list) else []
+    if batch_result.get("selectedCount") != len(outputs) or len(results) != len(outputs):
+        raise ReleasePipelineError("guarded dry-run did not pass with the expected selected output dirs")
+    result_dirs = [str(Path(str(item.get("outputDir") or "")).expanduser().resolve()) for item in results if isinstance(item, dict)]
+    if result_dirs != [str(path) for path in outputs]:
+        raise ReleasePipelineError("guarded dry-run output order does not match prepared output dirs")
+    for item in results:
+        if not isinstance(item, dict):
+            raise ReleasePipelineError("guarded dry-run result is malformed")
+        if item.get("status") != "dry_run":
+            raise ReleasePipelineError("guarded dry-run did not pass")
+        if item.get("skippedReason") or item.get("error"):
+            raise ReleasePipelineError("guarded dry-run contains skipped or failed items")
+    return run_dir, state, outputs
+
+
+def execute_preflight(root: Path, outputs: list[Path], *, allow_permission_skip: bool) -> list[dict[str, Any]]:
+    if DEFAULT_LOCK_PATH.exists():
+        raise ReleasePipelineError(f"active Feishu publish lock exists: {DEFAULT_LOCK_PATH}")
+    if not allow_permission_skip and not has_owner_env():
+        raise ReleasePipelineError(
+            "Missing Feishu owner config. Set FEISHU_OWNER_USER_ID / OPEN_ID / UNION_ID / EMAIL "
+            "or pass --allow-permission-skip."
+        )
+    blocked = historical_blocks(root)
+    checks: list[dict[str, Any]] = []
+    for output in outputs:
+        metadata_path = output / "metadata.json"
+        if not metadata_path.is_file():
+            raise ReleasePipelineError(f"{output.name}: missing metadata.json")
+        metadata = load_json(metadata_path)
+        feishu = get_feishu(metadata)
+        quality = metadata.get("quality") if isinstance(metadata.get("quality"), dict) else {}
+        if feishu.get("status") == "published" or feishu.get("documentUrl"):
+            raise ReleasePipelineError(f"{output.name}: already published")
+        if feishu.get("documentId"):
+            raise ReleasePipelineError(f"{output.name}: documentId already exists")
+        if feishu.get("requiresRemoteCheck") or feishu.get("requires_remote_check"):
+            raise ReleasePipelineError(f"{output.name}: requiresRemoteCheck is set")
+        if str(quality.get("status") or "") not in READY_QUALITY_STATUSES:
+            raise ReleasePipelineError(f"{output.name}: quality.status is not ready_for_edit")
+        if not title_state_ready(metadata, output):
+            raise ReleasePipelineError(f"{output.name}: missing or incomplete titles.md / metadata.titles")
+        if not (output / "feishu-publish.md").is_file():
+            raise ReleasePipelineError(f"{output.name}: missing feishu-publish.md")
+        if not (output / "images" / "cover.png").is_file():
+            raise ReleasePipelineError(f"{output.name}: missing images/cover.png")
+        if output.name in blocked:
+            raise ReleasePipelineError(f"{output.name}: historical blocked state exists at {blocked[output.name]}")
+        if str(feishu.get("status") or "") != "prepared":
+            raise ReleasePipelineError(f"{output.name}: metadata.publish.feishu.status must be prepared")
+        checks.append(
+            {
+                "slug": output.name,
+                "outputDir": str(output),
+                "metadataPath": str(metadata_path),
+                "feishuPublishPath": str(output / "feishu-publish.md"),
+                "publishReportPath": str(output / "publish-report.md"),
+                "qualityStatus": str(quality.get("status") or ""),
+            }
+        )
+    return checks
+
+
+def execute_batch(root: Path, outputs: list[Path], execute_run_id: str, allow_permission_skip: bool, publisher: str) -> dict[str, Any]:
+    command = [
+        "python3",
+        str(BATCH_SCRIPT),
+        "--root",
+        str(root),
+        "--limit",
+        str(len(outputs)),
+        "--run-id",
+        execute_run_id,
+    ]
+    for output in outputs:
+        command.extend(["--output-dir", str(output)])
+    if allow_permission_skip:
+        command.append("--allow-permission-skip")
+    if publisher:
+        command.extend(["--publisher", publisher])
+    result = run_command(command, timeout=max(180, 210 * len(outputs)))
+    if result.returncode != 0:
+        raise ReleasePipelineError(result.stderr.strip() or result.stdout.strip() or "execute batch publish failed")
+    return json.loads(result.stdout)
+
+
+def run_execute(args: argparse.Namespace) -> dict[str, Any]:
+    root = Path(args.root).expanduser().resolve()
+    guarded_run_id = args.confirm_run_id
+    guarded_run_dir, _guarded_state, outputs = load_guarded_run(root, guarded_run_id)
+    execute_run_id = args.run_id or f"{guarded_run_id}-execute"
+    run_dir = root / "batch-runs" / execute_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    preflight = execute_preflight(root, outputs, allow_permission_skip=args.allow_permission_skip)
+    pre_backup = write_backup_manifest(run_dir, outputs, filename="pre_execute_backup_manifest.json", include_publish_report=True)
+    batch_result = execute_batch(root, outputs, execute_run_id, args.allow_permission_skip, args.publisher)
+    image_failures = [
+        item for item in batch_result.get("results", []) if item.get("imageUploadResult") and item.get("imageUploadResult") != "1/1"
+    ]
+    status = "repair_required" if image_failures else "published"
+    post_extra = [
+        Path(str(batch_result.get("statePath") or "")),
+        Path(str(batch_result.get("summaryPath") or "")),
+    ]
+    post_backup = write_backup_manifest(
+        run_dir,
+        outputs,
+        filename="post_execute_backup_manifest.json",
+        include_publish_report=True,
+        extra_files=post_extra,
+    )
+    payload = {
+        "root": str(root),
+        "runId": execute_run_id,
+        "mode": "execute",
+        "selectedCount": len(outputs),
+        "prepared": [],
+        "skipped": [],
+        "risks": [],
+        "codexRequiredTasks": [],
+        "execute": {
+            "status": status,
+            "guardedRunId": guarded_run_id,
+            "guardedRunDir": str(guarded_run_dir),
+            "executeRunId": execute_run_id,
+            "selectedOutputDirs": [str(path) for path in outputs],
+            "preflight": preflight,
+            "batchResult": batch_result,
+            "imageFailures": image_failures,
+            "preBackupManifestPath": str(pre_backup),
+            "postBackupManifestPath": str(post_backup),
+            "repairRequired": bool(image_failures),
+        },
+        "batchDryRun": {"selectedCount": 0, "results": [], "statePath": "", "summaryPath": ""},
+        "guardedPublishCommand": "",
+        "paths": {
+            "runState": str(run_dir / "run_state.json"),
+            "summary": "",
+            "backupManifest": str(post_backup),
+            "codexRequiredTasks": "",
+        },
+    }
+    summary_path = write_execute_summary(run_dir, payload)
+    payload["paths"]["summary"] = str(summary_path)
+    write_json(Path(payload["paths"]["runState"]), {**payload, "finishedAt": utc_now()})
+    return payload
+
+
 def run_release(args: argparse.Namespace) -> dict[str, Any]:
+    if args.mode == "execute":
+        return run_execute(args)
+
     root = Path(args.root).expanduser().resolve()
     run_id = args.run_id or default_run_id()
     run_dir = root / "batch-runs" / run_id
@@ -659,7 +898,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare a guarded Feishu release from existing ContentFactory outputs.")
     parser.add_argument("--root", default=str(DEFAULT_ROOT))
     parser.add_argument("--count", type=int, default=5)
-    parser.add_argument("--mode", choices=["inspect", "prepare", "guarded"], default="inspect")
+    parser.add_argument("--mode", choices=["inspect", "prepare", "guarded", "execute"], default="inspect")
+    parser.add_argument("--confirm-run-id", default="", help="Required for execute mode; names the guarded run to publish.")
     parser.add_argument("--allow-permission-skip", action="store_true")
     parser.add_argument(
         "--allow-title-fallback",
@@ -669,6 +909,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--risk-policy", choices=["conservative"], default="conservative")
     parser.add_argument("--include-risky", action="store_true")
     parser.add_argument("--run-id", default="")
+    parser.add_argument("--publisher", default="", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 

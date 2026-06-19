@@ -181,6 +181,7 @@ def update_article_state(
         "dry_run",
         "blocked_remote_check",
         "not_started_after_failure",
+        "repair_required",
     }:
         article["finished_at"] = utc_now()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -877,6 +878,20 @@ def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
                 stop_reason = (
                     f"previous article {output_dir.name} requires remote state check; "
                     "later explicit outputs were not started."
+                )
+            elif not args.dry_run and result.get("imageUploadResult") and result.get("imageUploadResult") != "1/1":
+                stop_after_failure = True
+                stop_reason = (
+                    f"previous article {output_dir.name} image upload result was {result.get('imageUploadResult')}; "
+                    "later explicit outputs were not started pending repair reconciliation."
+                )
+                update_article_state(
+                    state,
+                    state_path,
+                    output_dir.name,
+                    current_stage="repair_required",
+                    last_error=stop_reason,
+                    cover_uploaded=False,
                 )
         state["finished_at"] = utc_now()
         write_json(state_path, state)
