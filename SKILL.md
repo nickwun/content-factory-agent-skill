@@ -546,6 +546,10 @@ Candidate rules:
 Inspect diagnostics:
 
 - `inspect` is a pure read-only diagnostic mode, but it must still output readiness gaps and Codex tasks.
+- `inspect` is a multi-gap diagnostic, not a single-status classifier.
+- Each article has `primaryStatus` for the main blocking state, while `gaps[]` is the complete ordered todo list.
+- `suggestedActions[]` gives the recommended processing order.
+- One article may appear in multiple groups, for example both `codexRequiredTasks` and `qualityRequired`.
 - Missing `article.md` is `codex_article_required`.
 - Missing `images/cover.png` is `codex_image_required`.
 - Missing or incomplete `titles.md` / `metadata.json.titles` is `codex_title_required`.
@@ -553,7 +557,8 @@ Inspect diagnostics:
 - `quality.status = needs_revision` or another non-ready value is `quality_revision_required`.
 - Ready quality with missing `feishu-publish.md` is `feishu_publish_required`.
 - Complete local publish state is `ready_for_guarded_dry_run`.
-- `inspect` must not automatically fix any issue; it only reports `codexRequiredTasks`, `qualityRequired`, `revisionRequired`, `feishuPublishRequired`, `readyForPrepare`, `readyForGuardedDryRun`, `riskExcluded`, `blocked`, and `allUnpublishedDiagnostics`.
+- Missing `feishu-publish.md` may be reported with `blockedBy` when title or quality gaps must be resolved first.
+- `inspect` must not automatically fix any issue; it only reports `codexRequiredTasks`, `qualityRequired`, `revisionRequired`, `feishuPublishRequired`, `readyForPrepare`, `readyForGuardedDryRun`, `riskExcluded`, `blocked`, `alreadyPublished`, and `allUnpublishedDiagnostics`.
 
 ## Feishu Review Status
 

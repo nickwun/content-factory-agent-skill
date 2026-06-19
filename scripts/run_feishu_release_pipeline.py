@@ -205,50 +205,79 @@ def inspect_diagnostic(output_dir: Path, metadata: dict[str, Any], blocked: dict
     requires_remote_check = bool(feishu.get("requiresRemoteCheck") or feishu.get("requires_remote_check"))
     historical_block_path = blocked.get(output_dir.name, "")
     risk = risk_reason(output_dir) if not include_risky else ""
+    gaps: list[str] = []
     missing: list[str] = []
-    suggested_action = ""
+    suggested_actions: list[str] = []
 
-    if publish_status == "published" or document_url:
-        status = "already_published"
-    elif requires_remote_check:
-        status = "requires_remote_check"
-    elif historical_block_path:
-        status = "historically_blocked"
-    elif risk:
-        status = "risk_excluded"
-    elif not article_exists:
-        status = "codex_article_required"
-        missing = ["article.md"]
-        suggested_action = "Codex should write article.md before prepare."
-    elif not cover_exists:
-        status = "codex_image_required"
-        missing = ["images/cover.png"]
-        suggested_action = "Codex image generation should create images/cover.png before prepare."
-    elif not titles_ready:
-        status = "codex_title_required"
+    if not article_exists:
+        gaps.append("codex_article_required")
+        missing.append("article.md")
+        suggested_actions.append("Codex should write article.md.")
+    if not cover_exists:
+        gaps.append("codex_image_required")
+        missing.append("images/cover.png")
+        suggested_actions.append("Codex image generation should create images/cover.png.")
+    if not titles_ready:
+        gaps.append("codex_title_required")
         if not titles_md_exists:
             missing.append("titles.md")
         if not metadata_titles_exists:
             missing.append("metadata.titles")
-        if not missing:
+        if "titles.md" not in missing and "metadata.titles" not in missing:
             missing = ["valid titles.md", "valid metadata.titles"]
-        suggested_action = "Codex should write titles.md and metadata.titles before prepare."
-    elif not quality_status:
-        status = "quality_check_required"
+        suggested_actions.append("Codex should write titles.md and metadata.titles.")
+    if not quality_status:
+        gaps.append("quality_check_required")
+        missing.append("metadata.quality.status")
+        suggested_actions.append("Run local quality_check_output.py after titles are present.")
     elif quality_status not in READY_QUALITY_STATUSES:
-        status = "quality_revision_required"
-    elif not feishu_publish_exists:
-        status = "feishu_publish_required"
+        gaps.append("quality_revision_required")
+        suggested_actions.append("Revise the article, then rerun local quality_check_output.py.")
+    can_need_feishu_publish = (
+        article_exists
+        and cover_exists
+        and not (publish_status == "published" or document_url)
+        and not requires_remote_check
+        and not historical_block_path
+        and not risk
+        and not (quality_status and quality_status not in READY_QUALITY_STATUSES)
+    )
+    if not feishu_publish_exists and can_need_feishu_publish:
+        gaps.append("feishu_publish_required")
+        missing.append("feishu-publish.md")
+        suggested_actions.append("Build feishu-publish.md after quality is ready.")
+
+    if publish_status == "published" or document_url:
+        primary_status = "already_published"
+    elif requires_remote_check:
+        primary_status = "requires_remote_check"
+    elif historical_block_path:
+        primary_status = "historically_blocked"
+    elif risk:
+        primary_status = "risk_excluded"
+    elif gaps:
+        priority = [
+            "codex_article_required",
+            "codex_image_required",
+            "codex_title_required",
+            "quality_revision_required",
+            "quality_check_required",
+            "feishu_publish_required",
+        ]
+        primary_status = next((item for item in priority if item in gaps), gaps[0])
     else:
-        status = "ready_for_guarded_dry_run"
+        primary_status = "ready_for_guarded_dry_run"
 
     return {
         "slug": output_dir.name,
         "path": str(output_dir),
         "outputDir": str(output_dir),
-        "status": status,
+        "primaryStatus": primary_status,
+        "status": primary_status,
+        "gaps": gaps,
         "missing": missing,
-        "suggestedAction": suggested_action,
+        "suggestedActions": suggested_actions,
+        "suggestedAction": suggested_actions[0] if suggested_actions else "",
         "articleExists": article_exists,
         "coverExists": cover_exists,
         "titlesMdExists": titles_md_exists,
@@ -388,14 +417,19 @@ def write_codex_required_tasks(run_dir: Path, tasks: list[dict[str, Any]]) -> st
 
 
 def codex_task_from_diagnostic(item: dict[str, Any]) -> dict[str, Any]:
-    required = item.get("missing") if isinstance(item.get("missing"), list) else []
+    missing = item.get("missing") if isinstance(item.get("missing"), list) else []
+    codex_required = {"article.md", "images/cover.png", "titles.md", "metadata.titles", "valid titles.md", "valid metadata.titles"}
+    required = [name for name in missing if name in codex_required]
     return {
         "slug": item["slug"],
         "path": item["path"],
         "outputDir": item["outputDir"],
         "required": required,
-        "status": item["status"],
+        "status": item["primaryStatus"],
+        "primaryStatus": item["primaryStatus"],
+        "gaps": item.get("gaps", []),
         "suggestedAction": item.get("suggestedAction") or "Codex should complete the missing content before prepare.",
+        "suggestedActions": item.get("suggestedActions", []),
         "tasks": required,
     }
 
@@ -457,6 +491,7 @@ def run_release(args: argparse.Namespace) -> dict[str, Any]:
     ready_for_prepare: list[dict[str, Any]] = []
     ready_for_guarded_dry_run: list[dict[str, Any]] = []
     blocked_items: list[dict[str, Any]] = []
+    already_published: list[dict[str, Any]] = []
     all_unpublished_diagnostics: list[dict[str, Any]] = []
     published_count = 0
 
@@ -464,9 +499,11 @@ def run_release(args: argparse.Namespace) -> dict[str, Any]:
         metadata = load_json(output / "metadata.json")
         if args.mode == "inspect":
             diagnostic = inspect_diagnostic(output, metadata, blocked, include_risky=args.include_risky)
-            status = diagnostic["status"]
+            status = diagnostic["primaryStatus"]
+            gaps = diagnostic.get("gaps", [])
             if status == "already_published":
                 published_count += 1
+                already_published.append(diagnostic)
                 skipped.append({"slug": output.name, "outputDir": str(output), "reason": status})
                 continue
             all_unpublished_diagnostics.append(diagnostic)
@@ -475,21 +512,24 @@ def run_release(args: argparse.Namespace) -> dict[str, Any]:
                 candidates.append({"slug": output.name, "outputDir": str(output)})
             else:
                 skipped.append({"slug": output.name, "outputDir": str(output), "reason": status})
-            if status in {"codex_article_required", "codex_image_required", "codex_title_required"}:
+            if {"codex_article_required", "codex_image_required", "codex_title_required"} & set(gaps):
                 codex_tasks.append(codex_task_from_diagnostic(diagnostic))
-            elif status == "quality_check_required":
+            if "quality_check_required" in gaps:
                 quality_required.append(diagnostic)
-            elif status == "quality_revision_required":
+            if "quality_revision_required" in gaps:
                 revision_required.append(diagnostic)
-            elif status == "feishu_publish_required":
-                feishu_publish_required.append(diagnostic)
-                ready_for_prepare.append(diagnostic)
-            elif status == "ready_for_guarded_dry_run":
+            if "feishu_publish_required" in gaps:
+                blocked_by = [gap for gap in gaps if gap != "feishu_publish_required"]
+                feishu_item = {**diagnostic, "blockedBy": blocked_by}
+                feishu_publish_required.append(feishu_item)
+                if not blocked_by:
+                    ready_for_prepare.append(feishu_item)
+            if status == "ready_for_guarded_dry_run":
                 ready_for_guarded_dry_run.append(diagnostic)
-            elif status == "risk_excluded":
+            if status == "risk_excluded":
                 risk_excluded.append(diagnostic)
                 risks.append({"slug": output.name, "outputDir": str(output), "reason": status})
-            elif status in {"requires_remote_check", "historically_blocked"}:
+            if status in {"requires_remote_check", "historically_blocked"}:
                 blocked_items.append(diagnostic)
             continue
 
@@ -572,6 +612,7 @@ def run_release(args: argparse.Namespace) -> dict[str, Any]:
         "readyForGuardedDryRun": ready_for_guarded_dry_run,
         "riskExcluded": risk_excluded,
         "blocked": blocked_items,
+        "alreadyPublished": already_published,
         "allUnpublishedDiagnostics": all_unpublished_diagnostics,
         "batchDryRun": batch_result,
         "guardedPublishCommand": guarded_publish_command,

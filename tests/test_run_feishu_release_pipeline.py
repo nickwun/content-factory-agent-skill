@@ -188,14 +188,16 @@ class RunFeishuReleasePipelineTest(unittest.TestCase):
         self.assertEqual(payload["publishedCount"], 0)
         self.assertEqual(payload["unpublishedCount"], 1)
         self.assertEqual([item["slug"] for item in payload["readyForGuardedDryRun"]], [ready.name])
-        self.assertEqual(self.diagnostic_for(payload, ready.name)["status"], "ready_for_guarded_dry_run")
+        ready_diag = self.diagnostic_for(payload, ready.name)
+        self.assertEqual(ready_diag["primaryStatus"], "ready_for_guarded_dry_run")
+        self.assertEqual(ready_diag["gaps"], [])
         self.assertEqual(payload["prepared"], [])
         self.assertEqual(payload["paths"]["runState"], "")
         after_files = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
         self.assertEqual(before_files, after_files)
 
     def test_inspect_reports_readiness_gaps_without_side_effects(self) -> None:
-        missing_titles = self.write_output("2026-06-19-missing-titles", titles=None)
+        missing_titles = self.write_output("2026-06-19-missing-titles", titles=None, quality_status=None)
         missing_quality = self.write_output("2026-06-19-missing-quality", quality_status=None)
         missing_article = self.write_output("2026-06-19-missing-article")
         (missing_article / "article.md").unlink()
@@ -236,23 +238,46 @@ class RunFeishuReleasePipelineTest(unittest.TestCase):
         self.assertEqual(payload["totalCount"], 11)
         self.assertEqual(payload["publishedCount"], 1)
         self.assertEqual(payload["unpublishedCount"], 10)
-        self.assertEqual(self.diagnostic_for(payload, missing_titles.name)["status"], "codex_title_required")
-        self.assertEqual(self.diagnostic_for(payload, missing_quality.name)["status"], "quality_check_required")
-        self.assertEqual(self.diagnostic_for(payload, missing_article.name)["status"], "codex_article_required")
-        self.assertEqual(self.diagnostic_for(payload, missing_cover.name)["status"], "codex_image_required")
-        self.assertEqual(self.diagnostic_for(payload, missing_feishu.name)["status"], "feishu_publish_required")
-        self.assertEqual(self.diagnostic_for(payload, ready.name)["status"], "ready_for_guarded_dry_run")
-        self.assertEqual(self.diagnostic_for(payload, revision.name)["status"], "quality_revision_required")
-        self.assertEqual(self.diagnostic_for(payload, risky.name)["status"], "risk_excluded")
-        self.assertEqual(self.diagnostic_for(payload, remote.name)["status"], "requires_remote_check")
-        self.assertEqual(self.diagnostic_for(payload, blocked.name)["status"], "historically_blocked")
+        missing_titles_diag = self.diagnostic_for(payload, missing_titles.name)
+        self.assertEqual(missing_titles_diag["primaryStatus"], "codex_title_required")
+        self.assertEqual(
+            missing_titles_diag["gaps"],
+            ["codex_title_required", "quality_check_required", "feishu_publish_required"],
+        )
+        self.assertEqual(
+            missing_titles_diag["suggestedActions"],
+            [
+                "Codex should write titles.md and metadata.titles.",
+                "Run local quality_check_output.py after titles are present.",
+                "Build feishu-publish.md after quality is ready.",
+            ],
+        )
+        self.assertEqual(self.diagnostic_for(payload, missing_quality.name)["primaryStatus"], "quality_check_required")
+        self.assertEqual(self.diagnostic_for(payload, missing_article.name)["primaryStatus"], "codex_article_required")
+        self.assertEqual(self.diagnostic_for(payload, missing_cover.name)["primaryStatus"], "codex_image_required")
+        self.assertEqual(self.diagnostic_for(payload, missing_feishu.name)["primaryStatus"], "feishu_publish_required")
+        self.assertEqual(self.diagnostic_for(payload, ready.name)["primaryStatus"], "ready_for_guarded_dry_run")
+        self.assertEqual(self.diagnostic_for(payload, revision.name)["primaryStatus"], "quality_revision_required")
+        self.assertEqual(self.diagnostic_for(payload, risky.name)["primaryStatus"], "risk_excluded")
+        self.assertEqual(self.diagnostic_for(payload, remote.name)["primaryStatus"], "requires_remote_check")
+        self.assertEqual(self.diagnostic_for(payload, blocked.name)["primaryStatus"], "historically_blocked")
         self.assertCountEqual(
             [item["slug"] for item in payload["codexRequiredTasks"]],
             [missing_titles.name, missing_article.name, missing_cover.name],
         )
-        self.assertEqual([item["slug"] for item in payload["qualityRequired"]], [missing_quality.name])
+        self.assertCountEqual(
+            [item["slug"] for item in payload["qualityRequired"]],
+            [missing_titles.name, missing_quality.name],
+        )
+        self.assertCountEqual(
+            [item["slug"] for item in payload["feishuPublishRequired"]],
+            [missing_titles.name, missing_quality.name, missing_feishu.name],
+        )
         self.assertEqual([item["slug"] for item in payload["revisionRequired"]], [revision.name])
-        self.assertEqual([item["slug"] for item in payload["feishuPublishRequired"]], [missing_feishu.name])
+        blocked_by = {item["slug"]: item["blockedBy"] for item in payload["feishuPublishRequired"]}
+        self.assertEqual(blocked_by[missing_titles.name], ["codex_title_required", "quality_check_required"])
+        self.assertEqual(blocked_by[missing_quality.name], ["quality_check_required"])
+        self.assertEqual(blocked_by[missing_feishu.name], [])
         self.assertEqual([item["slug"] for item in payload["readyForPrepare"]], [missing_feishu.name])
         self.assertEqual([item["slug"] for item in payload["readyForGuardedDryRun"]], [ready.name])
         self.assertEqual([item["slug"] for item in payload["riskExcluded"]], [risky.name])
