@@ -546,6 +546,17 @@ python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_feishu_releas
   --allow-permission-skip
 ```
 
+Execute preflight only:
+
+```bash
+python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_feishu_release_pipeline.py \
+  --root /Users/hui/Documents/ContentFactoryVault/04-Outputs \
+  --mode execute \
+  --confirm-run-id guarded-run-id \
+  --allow-permission-skip \
+  --preflight-only
+```
+
 Execute rules:
 
 - `--confirm-run-id` is required. The run must exist under `batch-runs/<confirm-run-id>/`.
@@ -554,6 +565,7 @@ Execute rules:
 - `execute` may only publish output dirs recorded by the guarded run, in guarded order.
 - The guarded run must have passed batch dry-run with explicit output dirs; skipped, failed, blocked, risky, or `requiresRemoteCheck` selected items must fail before publisher invocation.
 - Before publishing, each output must still have `publish.feishu.status = prepared`, no `documentUrl`, no `documentId`, no `requiresRemoteCheck`, `quality.status = ready_for_edit`, complete title state, `feishu-publish.md`, and `images/cover.png`.
+- `--preflight-only` performs the guarded-run read and execute preflight checks only. It must not call `publish_feishu_batch.py`, create Feishu documents, upload images, write execute run state, write execute summaries, write backup manifests, or modify the vault. On success it prints `preflight_passed=true` and the real execute command preview.
 - If no `FEISHU_OWNER_*` is configured, `execute` must fail unless `--allow-permission-skip` is explicit.
 - `execute` calls `publish_feishu_batch.py` with explicit `--output-dir` arguments and `--run-id <confirm-run-id>-execute`; it must not add `--check-blocks`.
 - If any article returns `imageUploadResult != 1/1`, the run is `repair_required`, later explicit outputs are not started, and manual repair/reconciliation is required. The pipeline must not auto-repair.

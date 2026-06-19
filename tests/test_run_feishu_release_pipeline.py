@@ -500,6 +500,114 @@ print(json.dumps({{"status": "published", "documentUrl": meta["publish"]["feishu
         self.assertIn("--confirm-run-id", result.stderr)
         self.assertEqual(self.publisher_log_slugs(), [])
 
+    def test_execute_preflight_only_does_not_call_publisher_or_write_execute_state(self) -> None:
+        first = self.write_output("2026-06-19-first")
+        second = self.write_output("2026-06-19-second")
+        self.write_guarded_run("guarded-preflight", [first, second])
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-preflight",
+            "--allow-permission-skip",
+            "--preflight-only",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["preflight_passed"])
+        self.assertEqual(payload["execute"]["status"], "preflight_passed")
+        self.assertEqual(payload["execute"]["selectedOutputDirs"], [str(first.resolve()), str(second.resolve())])
+        self.assertIn("--mode execute", payload["execute"]["executeCommand"])
+        self.assertIn("--confirm-run-id guarded-preflight", payload["execute"]["executeCommand"])
+        self.assertNotIn("--preflight-only", payload["execute"]["executeCommand"])
+        self.assertEqual(self.publisher_log_slugs(), [])
+        self.assertFalse((self.root / "batch-runs" / "guarded-preflight-execute").exists())
+
+    def test_execute_preflight_only_missing_guarded_run_fails_without_writing(self) -> None:
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "missing-guarded-run",
+            "--allow-permission-skip",
+            "--preflight-only",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("guarded run not found", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+        self.assertFalse((self.root / "batch-runs" / "missing-guarded-run-execute").exists())
+
+    def test_execute_preflight_only_rejects_published_output_without_calling_publisher(self) -> None:
+        output = self.write_output("2026-06-19-published", published=True)
+        self.write_guarded_run("guarded-preflight-published", [output])
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-preflight-published",
+            "--allow-permission-skip",
+            "--preflight-only",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already published", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+        self.assertFalse((self.root / "batch-runs" / "guarded-preflight-published-execute").exists())
+
+    def test_execute_preflight_only_rejects_missing_feishu_publish_without_calling_publisher(self) -> None:
+        output = self.write_output("2026-06-19-missing-feishu")
+        self.write_guarded_run("guarded-preflight-missing-feishu", [output])
+        (output / "feishu-publish.md").unlink(missing_ok=True)
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-preflight-missing-feishu",
+            "--allow-permission-skip",
+            "--preflight-only",
+            "--publisher",
+            str(self.publisher),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing feishu-publish.md", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+        self.assertFalse((self.root / "batch-runs" / "guarded-preflight-missing-feishu-execute").exists())
+
+    def test_execute_preflight_only_fails_fast_without_owner_or_permission_skip(self) -> None:
+        output = self.write_output("2026-06-19-ready")
+        self.write_guarded_run("guarded-preflight-owner", [output])
+        env = os.environ.copy()
+        for key in ["FEISHU_OWNER_USER_ID", "FEISHU_OWNER_EMAIL", "FEISHU_OWNER_OPEN_ID", "FEISHU_OWNER_UNION_ID"]:
+            env.pop(key, None)
+
+        result = self.run_script(
+            "--mode",
+            "execute",
+            "--confirm-run-id",
+            "guarded-preflight-owner",
+            "--preflight-only",
+            "--publisher",
+            str(self.publisher),
+            env=env,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FEISHU_OWNER", result.stderr)
+        self.assertEqual(self.publisher_log_slugs(), [])
+        self.assertFalse((self.root / "batch-runs" / "guarded-preflight-owner-execute").exists())
+
     def test_execute_fails_when_guarded_run_missing(self) -> None:
         result = self.run_script(
             "--mode",

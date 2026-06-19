@@ -646,15 +646,69 @@ def execute_batch(root: Path, outputs: list[Path], execute_run_id: str, allow_pe
     return json.loads(result.stdout)
 
 
+def pipeline_execute_command(
+    root: Path,
+    confirm_run_id: str,
+    allow_permission_skip: bool,
+    *,
+    run_id: str = "",
+) -> str:
+    parts = [
+        "python3",
+        str(SCRIPT_DIR / "run_feishu_release_pipeline.py"),
+        "--root",
+        str(root),
+        "--mode",
+        "execute",
+        "--confirm-run-id",
+        confirm_run_id,
+    ]
+    if allow_permission_skip:
+        parts.append("--allow-permission-skip")
+    if run_id:
+        parts.extend(["--run-id", run_id])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
 def run_execute(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.root).expanduser().resolve()
     guarded_run_id = args.confirm_run_id
     guarded_run_dir, _guarded_state, outputs = load_guarded_run(root, guarded_run_id)
     execute_run_id = args.run_id or f"{guarded_run_id}-execute"
+    preflight = execute_preflight(root, outputs, allow_permission_skip=args.allow_permission_skip)
+    command_preview = pipeline_execute_command(
+        root,
+        guarded_run_id,
+        args.allow_permission_skip,
+        run_id=args.run_id,
+    )
+    if args.preflight_only:
+        return {
+            "root": str(root),
+            "runId": execute_run_id,
+            "mode": "execute",
+            "preflight_only": True,
+            "preflight_passed": True,
+            "selectedCount": len(outputs),
+            "execute": {
+                "status": "preflight_passed",
+                "guardedRunId": guarded_run_id,
+                "guardedRunDir": str(guarded_run_dir),
+                "executeRunId": execute_run_id,
+                "selectedOutputDirs": [str(path) for path in outputs],
+                "preflight": preflight,
+                "executeCommand": command_preview,
+            },
+            "paths": {
+                "runState": "",
+                "summary": "",
+                "backupManifest": "",
+                "codexRequiredTasks": "",
+            },
+        }
+
     run_dir = root / "batch-runs" / execute_run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    preflight = execute_preflight(root, outputs, allow_permission_skip=args.allow_permission_skip)
     pre_backup = write_backup_manifest(run_dir, outputs, filename="pre_execute_backup_manifest.json", include_publish_report=True)
     batch_result = execute_batch(root, outputs, execute_run_id, args.allow_permission_skip, args.publisher)
     image_failures = [
@@ -688,6 +742,7 @@ def run_execute(args: argparse.Namespace) -> dict[str, Any]:
             "executeRunId": execute_run_id,
             "selectedOutputDirs": [str(path) for path in outputs],
             "preflight": preflight,
+            "executeCommand": command_preview,
             "batchResult": batch_result,
             "imageFailures": image_failures,
             "preBackupManifestPath": str(pre_backup),
@@ -900,6 +955,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=5)
     parser.add_argument("--mode", choices=["inspect", "prepare", "guarded", "execute"], default="inspect")
     parser.add_argument("--confirm-run-id", default="", help="Required for execute mode; names the guarded run to publish.")
+    parser.add_argument("--preflight-only", action="store_true", help="For execute mode: validate guarded run and local state without publishing or writing execute state.")
     parser.add_argument("--allow-permission-skip", action="store_true")
     parser.add_argument(
         "--allow-title-fallback",
