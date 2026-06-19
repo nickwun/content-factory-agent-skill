@@ -522,6 +522,38 @@ Batch rules:
 
 Use this to orchestrate existing `04-Outputs` articles before a Feishu batch release. The default flow stops at `guarded`; real publishing is only allowed through `execute`, and `execute` must confirm a completed guarded run.
 
+## Natural Language Release Commands
+
+When the user asks in natural language to publish ContentFactory outputs to Feishu, do not improvise commands. Map the request to this fixed SOP.
+
+For requests like `生成 5 篇文章并发布到飞书` or `准备并发布 5 篇低风险文章到飞书`:
+
+1. Run `inspect`.
+2. Use `codexRequiredTasks` to identify gaps.
+3. Codex fills required content gaps directly in the vault: `article.md`, `titles.md`, `metadata.titles`, `cover-prompt.md`, and `images/cover.png`.
+4. Run `prepare`.
+5. Run `guarded`.
+6. Stop at `guarded` by default. Output the real execute command preview, readiness/risk summary, and wait for explicit user confirmation.
+
+For requests like `确认执行发布` or `执行 guarded run <run_id>`:
+
+1. Run `execute --preflight-only --confirm-run-id <run_id>`.
+2. If preflight fails, do not publish.
+3. If preflight passes and the user has explicitly confirmed execution, run `execute --confirm-run-id <run_id>`.
+
+For requests like `全自动发布`:
+
+- Still do not bypass `guarded`.
+- Require a guarded run id, explicit execute confirmation, and explicit permission choice such as whether `--allow-permission-skip` is allowed.
+- If any of these are missing, stop and ask for confirmation rather than publishing.
+
+Responsibility boundaries:
+
+- Codex generates content: `article.md`, `titles.md`, `metadata.titles`, `cover-prompt.md`, and `images/cover.png`.
+- Local scripts handle workflow mechanics: `inspect`, `prepare`, quality checks, building `feishu-publish.md`, guarded dry-run, execute preflight, execute, repair/reconciliation, and backup manifests.
+- Allowed external capabilities: internet material search/webpage fetching, Feishu CLI/API publishing, and Feishu image upload.
+- Forbidden external model generation: OpenRouter, `OPENROUTER_API_KEY`, external LLM title generation, external LLM article generation, and external LLM cover-prompt generation.
+
 ```bash
 python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_feishu_release_pipeline.py \
   --root /Users/hui/Documents/ContentFactoryVault/04-Outputs \
