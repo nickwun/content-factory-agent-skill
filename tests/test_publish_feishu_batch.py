@@ -20,9 +20,12 @@ class PublishFeishuBatchTest(unittest.TestCase):
             """#!/usr/bin/env python3
 import json
 import sys
+import time
 from pathlib import Path
 
 out = Path(sys.argv[1])
+if "timeout" in out.name:
+    time.sleep(10)
 if "fail" in out.name:
     meta = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
     meta.setdefault("publish", {}).setdefault("feishu", {})["status"] = "failed"
@@ -85,17 +88,23 @@ print(json.dumps({"status":"prepared"}, ensure_ascii=False))
         published: bool = False,
         fail: bool = False,
         review_status: str = "",
+        feishu_publish: bool = True,
+        cover: bool = True,
+        quality_status: str = "ready_for_edit",
     ) -> Path:
         output = self.root / name
         output.mkdir(parents=True)
         (output / "article.md").write_text("# Article\n\n正文", encoding="utf-8")
         (output / "titles.md").write_text("# 标题候选\n", encoding="utf-8")
-        image = output / "images" / "cover.png"
-        image.parent.mkdir(parents=True)
-        image.write_bytes(b"fake-png")
+        if cover:
+            image = output / "images" / "cover.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"fake-png")
+        if feishu_publish:
+            (output / "feishu-publish.md").write_text("# 飞书发布稿\n\n![封面图](images/cover.png)\n", encoding="utf-8")
         metadata = {
             "title": name,
-            "quality": {"status": "ready_for_edit", "score": 100},
+            "quality": {"status": quality_status, "score": 100},
             "images": {"cover": {"status": "generated", "outputPath": "images/cover.png"}},
             "publish": {"feishu": {"status": "published" if published else "prepared"}},
         }
@@ -216,6 +225,141 @@ print(json.dumps({"status":"prepared"}, ensure_ascii=False))
         metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["publish"]["feishu"]["status"], "published")
         self.assertEqual(metadata["publish"]["feishu"]["permission"]["status"], "skipped")
+
+    def test_multiple_output_dirs_dry_run_preserves_order_and_does_not_scan(self) -> None:
+        other = self.write_output("2026-05-20-aaa-other")
+        second = self.write_output("2026-05-20-second")
+        first = self.write_output("2026-05-20-first")
+
+        result = self.run_script(
+            "--output-dir",
+            str(second),
+            "--output-dir",
+            str(first),
+            "--limit",
+            "2",
+            "--dry-run",
+            "--run-id",
+            "multi-dry-run",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["selectedCount"], 2)
+        self.assertEqual([item["outputDir"] for item in payload["results"]], [str(second.resolve()), str(first.resolve())])
+        state = json.loads(Path(payload["statePath"]).read_text(encoding="utf-8"))
+        self.assertEqual(state["selectionMode"], "output_dirs")
+        self.assertEqual(state["selected"], [str(second.resolve()), str(first.resolve())])
+        self.assertIn(second.name, state["articles"])
+        self.assertIn(first.name, state["articles"])
+        self.assertNotIn(other.name, state["articles"])
+        self.assertEqual(state["articles"][second.name]["current_stage"], "dry_run")
+        self.assertEqual(state["articles"][first.name]["current_stage"], "dry_run")
+
+    def test_multiple_output_dirs_dry_run_skips_published_and_keeps_unpublished(self) -> None:
+        published = self.write_output("2026-05-20-published", published=True)
+        draft = self.write_output("2026-05-20-draft")
+
+        result = self.run_script(
+            "--output-dir",
+            str(published),
+            "--output-dir",
+            str(draft),
+            "--limit",
+            "2",
+            "--dry-run",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual([item["status"] for item in payload["results"]], ["skipped", "dry_run"])
+        self.assertEqual(payload["results"][0]["skippedReason"], "already_published")
+
+    def test_multiple_output_dirs_missing_feishu_publish_is_skipped_without_publisher(self) -> None:
+        missing = self.write_output("2026-05-20-missing-feishu", feishu_publish=False)
+
+        result = self.run_script("--output-dir", str(missing), "--limit", "1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["results"][0]["status"], "skipped")
+        self.assertEqual(payload["results"][0]["skippedReason"], "missing_feishu_publish")
+        self.assertFalse((missing / "publish-report.md").exists())
+        metadata = json.loads((missing / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["publish"]["feishu"]["status"], "prepared")
+
+    def test_duplicate_output_dir_errors_before_lock_or_state(self) -> None:
+        output = self.write_output("2026-05-20-duplicate")
+
+        result = self.run_script(
+            "--output-dir",
+            str(output),
+            "--output-dir",
+            str(output),
+            "--limit",
+            "2",
+            "--run-id",
+            "duplicate-output",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate --output-dir", result.stderr)
+        self.assertFalse((self.root / ".codex_locks" / "feishu_publish.lock").exists())
+        self.assertFalse((self.root / "batch-runs" / "duplicate-output" / "run_state.json").exists())
+
+    def test_output_dir_outside_root_errors_before_lock_or_state(self) -> None:
+        inside = self.write_output("2026-05-20-inside")
+        outside_root = Path(self.tmp.name) / "outside"
+        outside_root.mkdir()
+        outside = outside_root / "outside-article"
+        outside.mkdir()
+        (outside / "metadata.json").write_text(json.dumps({"publish": {"feishu": {"status": "prepared"}}}), encoding="utf-8")
+
+        result = self.run_script(
+            "--output-dir",
+            str(inside),
+            "--output-dir",
+            str(outside),
+            "--limit",
+            "2",
+            "--run-id",
+            "outside-root",
+            "--dry-run",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be inside --root", result.stderr)
+        self.assertFalse((self.root / ".codex_locks" / "feishu_publish.lock").exists())
+        self.assertFalse((self.root / "batch-runs" / "outside-root" / "run_state.json").exists())
+
+    def test_real_timeout_stops_later_explicit_outputs(self) -> None:
+        timeout = self.write_output("2026-05-20-timeout")
+        later = self.write_output("2026-05-20-later")
+
+        result = self.run_script(
+            "--output-dir",
+            str(timeout),
+            "--output-dir",
+            str(later),
+            "--limit",
+            "2",
+            "--single-timeout",
+            "0.1",
+            "--run-id",
+            "timeout-stops",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual([item["status"] for item in payload["results"]], ["failed", "not_started_after_failure"])
+        timeout_meta = json.loads((timeout / "metadata.json").read_text(encoding="utf-8"))
+        later_meta = json.loads((later / "metadata.json").read_text(encoding="utf-8"))
+        self.assertTrue(timeout_meta["publish"]["feishu"]["requiresRemoteCheck"])
+        self.assertEqual(later_meta["publish"]["feishu"]["status"], "prepared")
+        state = json.loads(Path(payload["statePath"]).read_text(encoding="utf-8"))
+        self.assertTrue(state["articles"][timeout.name]["requires_remote_check"])
+        self.assertEqual(state["articles"][later.name]["current_stage"], "not_started_after_failure")
+        self.assertIn("previous article", state["articles"][later.name]["last_error"])
 
 
 if __name__ == "__main__":

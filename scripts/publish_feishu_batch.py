@@ -174,7 +174,14 @@ def update_article_state(
     if not article.get("started_at"):
         article["started_at"] = utc_now()
     article.update(updates)
-    if updates.get("current_stage") in {"published", "failed", "skipped", "dry_run", "blocked_remote_check"}:
+    if updates.get("current_stage") in {
+        "published",
+        "failed",
+        "skipped",
+        "dry_run",
+        "blocked_remote_check",
+        "not_started_after_failure",
+    }:
         article["finished_at"] = utc_now()
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, state)
@@ -201,6 +208,7 @@ def is_ready_unpublished(output_dir: Path) -> bool:
         output_dir / "article.md",
         output_dir / "titles.md",
         output_dir / "images" / "cover.png",
+        output_dir / "feishu-publish.md",
     ]
     if any(not path.is_file() for path in required_files):
         return False
@@ -239,31 +247,72 @@ def is_path_inside(child: Path, parent: Path) -> bool:
     return True
 
 
-def resolve_publish_scope(args: argparse.Namespace) -> tuple[Path, Path | None]:
-    output_arg = getattr(args, "output_dir", None)
+def normalize_output_dirs_arg(value: Any) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if item is not None]
+    return [value]
+
+
+def resolve_publish_scope(args: argparse.Namespace) -> tuple[Path, list[Path]]:
+    output_args = normalize_output_dirs_arg(getattr(args, "output_dir", None))
     root_arg = getattr(args, "root", None)
-    if output_arg:
-        output_dir = output_arg.expanduser().resolve()
-        if not output_dir.is_dir():
-            raise FeishuBatchError(f"--output-dir must be an existing directory: {output_dir}")
-        if not (output_dir / "metadata.json").is_file():
-            raise FeishuBatchError(f"--output-dir must contain metadata.json: {output_dir}")
-        root = root_arg.expanduser().resolve() if root_arg else output_dir.parent.resolve()
-        if not is_path_inside(output_dir, root):
-            raise FeishuBatchError(f"--output-dir must be inside --root: output={output_dir}, root={root}")
-        return root, output_dir
+    if output_args:
+        output_dirs = [path.expanduser().resolve() for path in output_args]
+        seen: set[Path] = set()
+        duplicates: list[Path] = []
+        for output_dir in output_dirs:
+            if output_dir in seen:
+                duplicates.append(output_dir)
+            seen.add(output_dir)
+        if duplicates:
+            duplicate_list = ", ".join(str(path) for path in duplicates)
+            raise FeishuBatchError(f"duplicate --output-dir values are not allowed: {duplicate_list}")
+        if len(output_dirs) > 5:
+            raise FeishuBatchError(f"--output-dir is limited to at most 5 values per batch; got {len(output_dirs)}.")
+        for output_dir in output_dirs:
+            if not output_dir.is_dir():
+                raise FeishuBatchError(f"--output-dir must be an existing directory: {output_dir}")
+            if not (output_dir / "metadata.json").is_file():
+                raise FeishuBatchError(f"--output-dir must contain metadata.json: {output_dir}")
+        root = root_arg.expanduser().resolve() if root_arg else output_dirs[0].parent.resolve()
+        for output_dir in output_dirs:
+            if not is_path_inside(output_dir, root):
+                raise FeishuBatchError(f"--output-dir must be inside --root: output={output_dir}, root={root}")
+        limit = max(int(getattr(args, "limit", 1)), 1)
+        if limit < len(output_dirs):
+            raise FeishuBatchError(
+                f"--limit ({limit}) must be greater than or equal to the number of --output-dir values ({len(output_dirs)})."
+            )
+        return root, output_dirs
     root = root_arg.expanduser().resolve() if root_arg else DEFAULT_ROOT.expanduser().resolve()
-    return root, None
+    return root, []
+
+
+READY_QUALITY_STATUSES = {"ready_for_edit", "ready", "publish_ready", "ready_to_publish"}
+
+
+def publish_blocking_reason(output_dir: Path) -> str:
+    metadata = load_json(output_dir / "metadata.json")
+    feishu = get_feishu(metadata)
+    quality = metadata.get("quality") if isinstance(metadata.get("quality"), dict) else {}
+    if feishu.get("status") == "published" and feishu.get("documentUrl"):
+        return "already_published"
+    if feishu.get("requiresRemoteCheck") or feishu.get("requires_remote_check"):
+        return "requires_remote_check"
+    if not (output_dir / "feishu-publish.md").is_file():
+        return "missing_feishu_publish"
+    if not (output_dir / "images" / "cover.png").is_file():
+        return "missing_cover"
+    quality_status = str(quality.get("status") or "")
+    if quality_status not in READY_QUALITY_STATUSES:
+        return f"quality_not_ready:{quality_status or 'missing'}"
+    return ""
 
 
 def output_needs_publish_attempt(output_dir: Path) -> bool:
-    metadata = load_json(output_dir / "metadata.json")
-    feishu = get_feishu(metadata)
-    if feishu.get("status") == "published" and feishu.get("documentUrl"):
-        return False
-    if feishu.get("requiresRemoteCheck"):
-        return False
-    return True
+    return publish_blocking_reason(output_dir) == ""
 
 
 def run_command(
@@ -551,7 +600,7 @@ def publish_one(
     metadata = load_json(output_dir / "metadata.json")
     feishu = get_feishu(metadata)
     article_state = state.get("articles", {}).get(output_dir.name, {})
-    if article_state.get("requires_remote_check") or feishu.get("requiresRemoteCheck"):
+    if article_state.get("requires_remote_check") or feishu.get("requiresRemoteCheck") or feishu.get("requires_remote_check"):
         error = (
             "remote state check required before retrying side-effecting Feishu publish steps; "
             "inspect Feishu and local metadata/run_state first."
@@ -585,7 +634,8 @@ def publish_one(
             "skippedReason": "requires_remote_check",
             "buildStatus": "not_run",
         }
-    if feishu.get("status") == "published" and feishu.get("documentUrl"):
+    blocking_reason = publish_blocking_reason(output_dir)
+    if blocking_reason == "already_published":
         update_article_state(
             state,
             state_path,
@@ -598,6 +648,29 @@ def publish_one(
         summary["status"] = "skipped"
         summary["skippedReason"] = "already_published"
         return summary
+    if blocking_reason:
+        update_article_state(
+            state,
+            state_path,
+            output_dir.name,
+            current_stage="skipped",
+            skipped_reason=blocking_reason,
+            last_error=blocking_reason,
+        )
+        return {
+            "outputDir": str(output_dir),
+            "status": "skipped",
+            "documentId": str(feishu.get("documentId") or ""),
+            "documentUrl": str(feishu.get("documentUrl") or ""),
+            "backend": str(feishu.get("backend") or ""),
+            "permissionStatus": "",
+            "permissionGrantedTo": "",
+            "imageUploadResult": parse_image_upload_result(output_dir / "publish-report.md"),
+            "reportPath": "",
+            "error": "",
+            "skippedReason": blocking_reason,
+            "buildStatus": "not_run",
+        }
     if args.dry_run:
         update_article_state(state, state_path, output_dir.name, current_stage="dry_run")
         return {
@@ -719,7 +792,7 @@ def write_batch_summary(root: Path, results: list[dict[str, Any]], selected: lis
 
 
 def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
-    root, output_dir = resolve_publish_scope(args)
+    root, output_dirs = resolve_publish_scope(args)
     limit = min(max(args.limit, 1), 5)
     run_id = args.run_id or run_id_now()
     env = os.environ.copy()
@@ -732,7 +805,7 @@ def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
     if args.owner_union_id:
         env["FEISHU_OWNER_UNION_ID"] = args.owner_union_id
 
-    selected = [output_dir] if output_dir else select_outputs(root, limit)
+    selected = output_dirs if output_dirs else select_outputs(root, limit)
     requires_owner = any(output_needs_publish_attempt(path) for path in selected)
     if requires_owner and not args.dry_run and not args.allow_permission_skip and not has_owner_config(args, env):
         raise owner_required_error()
@@ -745,7 +818,7 @@ def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
     logs_dir = state_path.parent / "logs"
     try:
         update_publish_lock(lock_path, current_step="selected_outputs")
-        state["selectionMode"] = "output_dir" if output_dir else "root_scan"
+        state["selectionMode"] = "output_dirs" if len(output_dirs) > 1 else "output_dir" if output_dirs else "root_scan"
         state["selected"] = [str(path) for path in selected]
         write_json(state_path, state)
     except Exception as exc:
@@ -753,8 +826,42 @@ def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
         raise
 
     try:
-        results = [
-            publish_one(
+        results = []
+        stop_after_failure = False
+        stop_reason = ""
+        for output_dir in selected:
+            if stop_after_failure:
+                update_publish_lock(
+                    lock_path,
+                    current_article=output_dir.name,
+                    current_step="not_started_after_failure",
+                )
+                update_article_state(
+                    state,
+                    state_path,
+                    output_dir.name,
+                    current_stage="not_started_after_failure",
+                    last_error=stop_reason,
+                    skipped_reason="not_started_after_failure",
+                )
+                results.append(
+                    {
+                        "outputDir": str(output_dir),
+                        "status": "not_started_after_failure",
+                        "documentId": "",
+                        "documentUrl": "",
+                        "backend": "",
+                        "permissionStatus": "",
+                        "permissionGrantedTo": "",
+                        "imageUploadResult": "",
+                        "reportPath": "",
+                        "error": stop_reason,
+                        "skippedReason": "not_started_after_failure",
+                        "buildStatus": "not_run",
+                    }
+                )
+                continue
+            result = publish_one(
                 output_dir,
                 args,
                 env,
@@ -763,8 +870,14 @@ def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
                 logs_dir=logs_dir,
                 lock_path=lock_path,
             )
-            for output_dir in selected
-        ]
+            results.append(result)
+            article_state = state.get("articles", {}).get(output_dir.name, {})
+            if result.get("status") == "blocked_remote_check" or article_state.get("requires_remote_check"):
+                stop_after_failure = True
+                stop_reason = (
+                    f"previous article {output_dir.name} requires remote state check; "
+                    "later explicit outputs were not started."
+                )
         state["finished_at"] = utc_now()
         write_json(state_path, state)
         summary_path = write_batch_summary(root, results, selected)
@@ -787,7 +900,7 @@ def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Publish up to 5 ready ContentFactory outputs to Feishu.")
     parser.add_argument("--root", type=Path, default=None)
-    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, action="append", default=None)
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--builder", type=Path, default=DEFAULT_BUILDER)
     parser.add_argument("--publisher", type=Path, default=DEFAULT_PUBLISHER)
@@ -800,7 +913,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-permission-skip", action="store_true")
     parser.add_argument("--lock-path", type=Path, default=DEFAULT_LOCK_PATH)
     parser.add_argument("--run-id", default="")
-    parser.add_argument("--single-timeout", type=int, default=SINGLE_PUBLISH_TIMEOUT_SECONDS)
+    parser.add_argument("--single-timeout", type=float, default=SINGLE_PUBLISH_TIMEOUT_SECONDS)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
