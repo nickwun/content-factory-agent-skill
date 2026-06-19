@@ -1,0 +1,6 @@
+interface:
+  display_name: "Content Factory Agent"
+  short_description: "Use Obsidian profiles and corpus to draft articles"
+  default_prompt: "Use $content-factory-agent to turn my pasted material into a Markdown article with metadata and a cover prompt."
+policy:
+  allow_implicit_invocation: true
