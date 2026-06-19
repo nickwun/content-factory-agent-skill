@@ -17,7 +17,10 @@ Content generation policy:
 - Production scripts must not call OpenRouter or other external LLM APIs for article, title, cover prompt, or content-judgment generation.
 - Internet material search and webpage fetching remain allowed for source-material collection.
 - Feishu CLI/API calls remain allowed for explicitly requested publishing, image upload, read-only checks, and repair workflows.
-- Scripts are responsible for validation, file/state management, Feishu publish preparation, Feishu publishing, reports, and backups.
+- Missing title state must stop with `codex_title_required`; Codex must write `titles.md` and `metadata.json.titles`.
+- Missing article text must stop with `codex_article_required`; Codex must write `article.md`.
+- Missing cover image must stop with `codex_image_required`; Codex image generation must create `images/cover.png`.
+- Scripts are responsible for validation, building publish Markdown, Feishu publishing, state, audit, reports, and backups.
 
 ## Core Workflow
 
@@ -514,6 +517,31 @@ Batch rules:
 - Mark successful outputs as `publish.feishu.review.status = pending_review`.
 - Write `batch-runs/YYYY-MM-DD-feishu-publish-batch-NN.md`.
 - Do not modify `article.md`, `titles.md`, `images/cover.png`, or `source-registry.json`.
+
+## Guarded Feishu Release Pipeline
+
+Use this to orchestrate existing `04-Outputs` articles before a Feishu batch release. Version 1 never executes a real publish command; real publishing must remain a separate explicit command until a future `--execute` milestone exists.
+
+```bash
+python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_feishu_release_pipeline.py \
+  --root /Users/hui/Documents/ContentFactoryVault/04-Outputs \
+  --count 5 \
+  --mode inspect
+```
+
+Modes:
+
+- `inspect`: scan only. It must not modify the vault, run quality checks, build `feishu-publish.md`, write run state, write summary files, or call Feishu.
+- `prepare`: local preparation is allowed. It may run quality checks, build `feishu-publish.md`, and write run state, summary, Codex task notes, and backup manifests. It must not call real Feishu publish or upload images.
+- `guarded`: includes `prepare`, then calls `publish_feishu_batch.py --dry-run` with explicit `--output-dir` arguments and prints the real publish command preview. It must not execute that command.
+
+Candidate rules:
+
+- Exclude already published outputs, outputs with `documentUrl`, `requiresRemoteCheck`, historical blocked state, risky slugs, missing article, missing cover, or not-ready quality.
+- Risky slugs include `heart-risk`, `liver`, `drinking`, `red-flags`, and non-ASCII paths unless `--include-risky` is explicitly passed.
+- Missing `titles.md` or `metadata.json.titles` is `codex_title_required`; the pipeline must not call OpenRouter, must not call `generate_titles.py --no-ai`, and must not generate fallback titles.
+- If `--allow-title-fallback` is passed for compatibility, fallback output still cannot become publish-ready; it must stop as `needs_manual_title_review`.
+- When Codex-authored title or article work is needed, write it directly into the output directory first, then rerun the pipeline.
 
 ## Feishu Review Status
 
