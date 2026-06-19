@@ -134,3 +134,33 @@ Create a targeted backup containing published article state, publish reports, ru
 - Already published: stop, do not duplicate publish.
 - Missing owner: fail fast unless the user explicitly allowed `--allow-permission-skip`.
 
+## Insufficient Low-Risk Inventory
+
+Low-risk inventory shortage is not an error. It is a safe stop state.
+
+The pipeline reports `insufficient_low_risk_inventory` when `inspect` finds that the requested count cannot be satisfied by conservative low-risk inventory, and the remaining unpublished outputs are excluded by risk policy.
+
+Rules:
+
+- Do not automatically relax `--risk-policy conservative`.
+- Do not automatically process `riskExcluded` outputs.
+- Risk-excluded articles can only enter an explicit human review path.
+- Do not continue into `prepare`, `guarded`, or `execute`.
+- The standard next step is to create new low-risk topic candidates and wait for user confirmation.
+
+Inventory refill flow:
+
+```text
+inspect
+-> insufficient_low_risk_inventory
+-> Codex creates low-risk topic candidates
+-> user confirms topics
+-> Codex writes article.md / titles.md / cover-prompt.md / cover image
+-> prepare
+-> guarded
+-> user confirms
+-> execute preflight
+-> execute
+```
+
+Internet material search and webpage fetching remain allowed for topic sourcing. OpenRouter and external LLM generation remain forbidden. Codex writes articles, titles, cover prompts, and cover images; scripts handle validation, build state, publishing, audit, and backups.

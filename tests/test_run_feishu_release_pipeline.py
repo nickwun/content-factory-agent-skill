@@ -382,6 +382,33 @@ print(json.dumps({{"status": "published", "documentUrl": meta["publish"]["feishu
         after_files = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
         self.assertEqual(before_files, after_files)
 
+    def test_inspect_reports_insufficient_low_risk_inventory_when_all_unpublished_are_risky(self) -> None:
+        self.write_output("2026-06-19-published", published=True)
+        red_flags = self.write_output("2026-06-19-running-red-flags", titles=None, quality_status=None)
+        heart_risk = self.write_output("2026-06-19-heart-risk-story")
+        liver = self.write_output("2026-06-19-running-drinking-liver")
+        before_files = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
+        env = os.environ.copy()
+        env["OPENROUTER_API_KEY"] = "must-not-be-used"
+
+        result = self.run_script("--mode", "inspect", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["inventoryStatus"], "insufficient_low_risk_inventory")
+        self.assertEqual(payload["requestedCount"], 5)
+        self.assertEqual(payload["availableReadyForPrepare"], 0)
+        self.assertEqual(payload["availableReadyForGuardedDryRun"], 0)
+        self.assertEqual(payload["riskExcludedCount"], 3)
+        self.assertEqual(payload["recommendedNextStep"], "codex_generate_low_risk_topic_candidates")
+        self.assertEqual(payload["readyForPrepare"], [])
+        self.assertEqual(payload["readyForGuardedDryRun"], [])
+        self.assertCountEqual([item["slug"] for item in payload["riskExcluded"]], [red_flags.name, heart_risk.name, liver.name])
+        self.assertFalse((self.root / "batch-runs" / "test-release").exists())
+        self.assertFalse(any(path.name.startswith("generate_titles") for path in self.root.rglob("*")))
+        after_files = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
+        self.assertEqual(before_files, after_files)
+
     def test_prepare_prepares_low_risk_outputs_and_skips_published_risky_and_blocked(self) -> None:
         ready = self.write_output("2026-06-19-running-social-quiet")
         self.write_output("2026-06-19-heart-risk-story")

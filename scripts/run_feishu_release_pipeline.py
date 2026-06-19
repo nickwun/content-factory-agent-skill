@@ -886,6 +886,18 @@ def run_release(args: argparse.Namespace) -> dict[str, Any]:
     if args.mode == "guarded" and selected_paths:
         guarded_publish_command = guarded_command(root, selected_paths, run_id, args.allow_permission_skip)
 
+    inventory_status = ""
+    recommended_next_step = ""
+    if args.mode == "inspect":
+        all_remaining_are_risk_excluded = bool(all_unpublished_diagnostics) and len(risk_excluded) == len(all_unpublished_diagnostics)
+        if (
+            len(ready_for_prepare) < args.count
+            and len(ready_for_guarded_dry_run) < args.count
+            and all_remaining_are_risk_excluded
+        ):
+            inventory_status = "insufficient_low_risk_inventory"
+            recommended_next_step = "codex_generate_low_risk_topic_candidates"
+
     payload = {
         "root": str(root),
         "runId": run_id,
@@ -893,6 +905,12 @@ def run_release(args: argparse.Namespace) -> dict[str, Any]:
         "totalCount": len(outputs),
         "publishedCount": published_count if args.mode == "inspect" else 0,
         "unpublishedCount": len(all_unpublished_diagnostics) if args.mode == "inspect" else 0,
+        "inventoryStatus": inventory_status,
+        "requestedCount": args.count,
+        "availableReadyForPrepare": len(ready_for_prepare),
+        "availableReadyForGuardedDryRun": len(ready_for_guarded_dry_run),
+        "riskExcludedCount": len(risk_excluded),
+        "recommendedNextStep": recommended_next_step,
         "selectedCount": len(selected_paths),
         "candidates": candidates,
         "skipped": skipped,
