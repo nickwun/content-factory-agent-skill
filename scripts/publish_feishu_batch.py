@@ -363,6 +363,15 @@ def has_owner_config(args: argparse.Namespace, env: dict[str, str]) -> bool:
     return any(str(value or "").strip() for value in values)
 
 
+def owner_required_error() -> FeishuBatchError:
+    return FeishuBatchError(
+        "Batch Feishu publishing requires owner permission config. Set one of "
+        "FEISHU_OWNER_USER_ID / FEISHU_OWNER_OPEN_ID / FEISHU_OWNER_UNION_ID / FEISHU_OWNER_EMAIL "
+        "or pass the matching --owner-* flag. Use --allow-permission-skip only for an intentional "
+        "permission-skip probe."
+    )
+
+
 def mark_publish_failed(output_dir: Path, error: str, *, requires_remote_check: bool = False) -> None:
     metadata_path = output_dir / "metadata.json"
     try:
@@ -713,21 +722,6 @@ def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
     root, output_dir = resolve_publish_scope(args)
     limit = min(max(args.limit, 1), 5)
     run_id = args.run_id or run_id_now()
-    state_path = run_state_path(root, run_id)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state = load_run_state(state_path, run_id)
-    lock_path = args.lock_path.expanduser().resolve()
-    acquire_publish_lock(lock_path, f"feishu_publish_batch:{run_id}")
-    logs_dir = state_path.parent / "logs"
-    try:
-        selected = [output_dir] if output_dir else select_outputs(root, limit)
-        update_publish_lock(lock_path, current_step="selected_outputs")
-        state["selectionMode"] = "output_dir" if output_dir else "root_scan"
-        state["selected"] = [str(path) for path in selected]
-        write_json(state_path, state)
-    except Exception as exc:
-        update_publish_lock(lock_path, current_step="failed", last_error=str(exc))
-        raise
     env = os.environ.copy()
     if args.owner_user_id:
         env["FEISHU_OWNER_USER_ID"] = args.owner_user_id
@@ -738,14 +732,27 @@ def publish_batch(args: argparse.Namespace) -> dict[str, Any]:
     if args.owner_union_id:
         env["FEISHU_OWNER_UNION_ID"] = args.owner_union_id
 
-    try:
-        requires_owner = any(output_needs_publish_attempt(path) for path in selected)
-        if requires_owner and not args.dry_run and not args.allow_permission_skip and not has_owner_config(args, env):
-            raise FeishuBatchError(
-                "Batch Feishu publishing requires owner permission config. Set FEISHU_OWNER_USER_ID "
-                "or pass --owner-user-id. Use --allow-permission-skip only for an intentional permission-skip probe."
-            )
+    selected = [output_dir] if output_dir else select_outputs(root, limit)
+    requires_owner = any(output_needs_publish_attempt(path) for path in selected)
+    if requires_owner and not args.dry_run and not args.allow_permission_skip and not has_owner_config(args, env):
+        raise owner_required_error()
 
+    state_path = run_state_path(root, run_id)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = load_run_state(state_path, run_id)
+    lock_path = args.lock_path.expanduser().resolve()
+    acquire_publish_lock(lock_path, f"feishu_publish_batch:{run_id}")
+    logs_dir = state_path.parent / "logs"
+    try:
+        update_publish_lock(lock_path, current_step="selected_outputs")
+        state["selectionMode"] = "output_dir" if output_dir else "root_scan"
+        state["selected"] = [str(path) for path in selected]
+        write_json(state_path, state)
+    except Exception as exc:
+        update_publish_lock(lock_path, current_step="failed", last_error=str(exc))
+        raise
+
+    try:
         results = [
             publish_one(
                 output_dir,
