@@ -11,6 +11,14 @@ Default vault path: `/Users/hui/Documents/ContentFactoryVault`.
 
 This skill creates file-based content packages. It may publish prepared outputs to Feishu via Feishu CLI only when explicitly requested. It does not call WeChat APIs, replace the web workspace, or auto-publish without confirmation.
 
+Content generation policy:
+
+- Codex writes article text, title candidates, and cover prompts directly into the vault.
+- Production scripts must not call OpenRouter or other external LLM APIs for article, title, cover prompt, or content-judgment generation.
+- Internet material search and webpage fetching remain allowed for source-material collection.
+- Feishu CLI/API calls remain allowed for explicitly requested publishing, image upload, read-only checks, and repair workflows.
+- Scripts are responsible for validation, file/state management, Feishu publish preparation, Feishu publishing, reports, and backups.
+
 ## Core Workflow
 
 1. If the user asks to normalize Word material, run `normalize-docx-material` first.
@@ -373,14 +381,20 @@ Title rules:
 - Do not copy the original source title.
 - Do not copy corpus titles or corpus sentences.
 
-Generate or backfill title candidates for existing outputs:
+Validate title candidates for existing outputs:
 
 ```bash
 python3 /Users/hui/.codex/skills/content-factory-agent/scripts/generate_titles.py \
-  /Users/hui/Documents/ContentFactoryVault/04-Outputs/YYYY-MM-DD-slug \
-  --env-file /Users/hui/Documents/distributing-web/.env.local \
-  --model openai/gpt-5.4-mini
+  /Users/hui/Documents/ContentFactoryVault/04-Outputs/YYYY-MM-DD-slug
 ```
+
+`generate_titles.py` no longer generates titles and no longer calls OpenRouter or any external LLM API. It only checks that `titles.md` and `metadata.json.titles` exist and are structurally complete.
+
+If title state is missing or incomplete, it exits non-zero with status:
+
+`codex_title_required`
+
+When this happens, Codex must write `titles.md` and `metadata.json.titles` directly, then rerun validation. Do not use `--no-ai` fallback as a publishing-preparation path; the flag is accepted only for backward-compatible CLI parsing and does not generate titles.
 
 ## Feishu Publish Markdown
 
@@ -628,17 +642,14 @@ Run with an explicit source:
 
 ```bash
 python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_single_article_pipeline.py \
-  --source-id source-xxx \
-  --env-file /Users/hui/Documents/distributing-web/.env.local \
-  --text-model openai/gpt-5.4-mini
+  --source-id source-xxx
 ```
 
 Or let the script pick the first `unused` source in `01-Materials/source-registry.json`:
 
 ```bash
 python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_single_article_pipeline.py \
-  --env-file /Users/hui/Documents/distributing-web/.env.local \
-  --text-model openai/gpt-5.4-mini
+  --env-file /Users/hui/Documents/distributing-web/.env.local
 ```
 
 The single pipeline performs:
@@ -648,8 +659,8 @@ The single pipeline performs:
 3. Normalize DOCX to `01-Materials/rewrite-sources/*.md`.
 4. Stop if the cleaning note says the material cannot enter rewrite.
 5. Mark the source as `processing`.
-6. Generate `article.md`, `brief.md`, `metadata.json`, and `cover-prompt.md`.
-7. Generate `titles.md` and update `metadata.json.titles`.
+6. Require Codex-authored `article.md`, `brief.md`, `metadata.json`, `cover-prompt.md`, and title state; production scripts do not call external LLM APIs for these.
+7. Validate `titles.md` and `metadata.json.titles`. If missing, stop with `codex_title_required`.
 8. Prepare the cover prompt and mark the output as requiring Codex direct image generation.
 9. Use Codex image generation directly to create `images/cover.png`, then update cover metadata with `provider: codex-imagegen`.
 10. Mark the source as `used` after article output and title candidates exist, even if Codex cover generation still needs to be completed manually.
@@ -665,7 +676,8 @@ Output directory naming:
 State rules:
 
 - Normalize failure: do not mark the source as `used`; record a failure note.
-- Article generation failure: mark source as `failed`, not `used`.
+- Missing article text or disabled article generation: stop with `codex_article_required`; Codex must write `article.md`, `brief.md`, `metadata.json`, and `cover-prompt.md`.
+- Missing title state: stop with `codex_title_required`; Codex must write `titles.md` and `metadata.json.titles`.
 - Codex cover still pending after article success: mark source as `used`; record `metadata.images.cover.status = prompt_ready`.
 - Full success: mark source as `used`; record `metadata.images.cover.status = generated` and `metadata.images.cover.provider = codex-imagegen`.
 
@@ -675,7 +687,7 @@ Quality gates before writing a successful article output:
 - Article must include at least three `01 / 02 / 03` modules.
 - Article must be 1100-1300 Chinese characters excluding whitespace.
 - Article must not expose internal source narration such as “素材里提到”, “原文说”, or “根据资料”.
-- The script retries article generation before failing the source. Prefer a model capable of long Chinese article output; `openai/gpt-5.4-mini` has been verified as a better fit than very small/nano models for this pipeline.
+- The script does not call OpenRouter or any external LLM API for article generation. If article text is missing, Codex must produce it directly in the vault before the pipeline can proceed.
 
 This script is single-item only. Do not use it for batch pipeline work until a separate small-batch pipeline milestone exists.
 
@@ -689,18 +701,14 @@ Run with explicit sources:
 python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_pipeline_batch.py \
   --source-id source-a \
   --source-id source-b \
-  --source-id source-c \
-  --env-file /Users/hui/Documents/distributing-web/.env.local \
-  --text-model openai/gpt-5.4-mini
+  --source-id source-c
 ```
 
 Or let the script choose up to 5 `unused` sources:
 
 ```bash
 python3 /Users/hui/.codex/skills/content-factory-agent/scripts/run_pipeline_batch.py \
-  --limit 3 \
-  --env-file /Users/hui/Documents/distributing-web/.env.local \
-  --text-model openai/gpt-5.4-mini
+  --limit 3
 ```
 
 Small batch rules:

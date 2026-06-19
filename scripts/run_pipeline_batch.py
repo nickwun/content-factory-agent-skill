@@ -229,7 +229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile", default=str(DEFAULT_VAULT / "02-Profiles" / "ahong-running-rewrite.md"))
     parser.add_argument("--corpus", default=str(DEFAULT_VAULT / "03-Corpus" / "ahong-running-style.md"))
     parser.add_argument("--env-file", default="")
-    parser.add_argument("--text-model", default="openai/gpt-5.4-mini")
+    parser.add_argument("--text-model", default="", help="Deprecated; external LLM article generation is disabled.")
     parser.add_argument("--article-attempts", type=int, default=5)
     parser.add_argument("--cover-provider", default="codex-imagegen")
     parser.add_argument("--cover-model", default="")

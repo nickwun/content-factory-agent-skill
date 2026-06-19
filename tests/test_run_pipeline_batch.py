@@ -28,6 +28,27 @@ if "FAIL_ARTICLE" in prompt:
     print("fake article failed", file=sys.stderr)
     raise SystemExit(9)
 cover_body = "FAIL_GENERATION" if "FAIL_COVER" in prompt else "中国中年跑者在清晨跑道上慢跑，4:3，禁止文字和 logo。"
+titles = {
+    "pain_point": [
+        "普通跑者面对5公里和10公里，到底该怎么选才不容易跑偏？",
+        "5公里不是问题，真正容易出错的是忽略恢复",
+        "为什么很多人跑步一认真，反而把热情跑丢了？",
+        "跑5公里还是10公里，别再互相看不起了",
+        "刚开始跑步就想一步到位，普通人最容易吃这个亏",
+    ],
+    "cognitive_gap": [
+        "5公里和10公里的差别，不只是数字和距离",
+        "普通跑者先学会跑得舒服，比急着证明自己更重要",
+        "跑步不是越远越值，能长期恢复才是真正的有效",
+        "看懂第二天身体反馈，你就不会总被公里数牵着走",
+        "很多人以为跑得少没用，其实合适的距离更能留住状态",
+    ],
+    "recommended": {
+        "primary": "普通跑者面对5公里和10公里，到底该怎么选才不容易跑偏？",
+        "secondary": "5公里和10公里的差别，不只是数字和距离",
+        "reason": "首选标题击中普通跑者的选择焦虑，备选标题提供认知翻转。",
+    },
+}
 
 article = \"\"\"# 跑步距离怎么选
 
@@ -92,6 +113,7 @@ print(json.dumps({
     "article": article,
     "brief": "# Brief\\n\\n- 小批量测试。",
     "coverPrompt": "# Cover Prompt\\n\\n## 视觉主体\\n\\n" + cover_body,
+    "titles": titles,
 }, ensure_ascii=False))
 """
 
@@ -164,7 +186,6 @@ class RunPipelineBatchTest(unittest.TestCase):
         env = os.environ.copy()
         env["CONTENT_FACTORY_ARTICLE_GENERATOR"] = str(self.article_generator)
         env["CONTENT_FACTORY_COVER_GENERATOR"] = str(self.cover_generator)
-        env["CONTENT_FACTORY_TITLES_NO_AI"] = "1"
         return env
 
     def seed_sources(self) -> list[str]:

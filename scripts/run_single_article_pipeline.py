@@ -12,8 +12,6 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -359,51 +357,13 @@ def run_external_article_generator(prompt: str, output_dir: Path) -> dict[str, A
     return parse_json_payload(result.stdout)
 
 
-def run_openrouter_article_generator(prompt: str, model: str) -> dict[str, Any]:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        raise PipelineError("OPENROUTER_API_KEY is not configured.")
-    base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-    payload = {
-        "model": model or os.environ.get("OPENROUTER_MODEL", "openai/gpt-5.4-mini"),
-        "messages": [
-            {"role": "system", "content": "你是严谨的中文公众号文章生产 Agent，只输出请求的 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.7,
-        "max_tokens": int(os.environ.get("CONTENT_FACTORY_ARTICLE_MAX_TOKENS", "5000")),
-    }
-    request = urllib.request.Request(
-        f"{base_url}/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://content-factory.local",
-            "X-Title": "Content Factory Agent",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="ignore")
-        raise PipelineError(f"OpenRouter article generation failed: HTTP {exc.code} {body[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise PipelineError(f"OpenRouter article generation failed: {exc}") from exc
-
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise PipelineError("OpenRouter response did not include message content.") from exc
-    return parse_json_payload(str(content))
-
-
 def generate_article_payload(prompt: str, output_dir: Path, model: str) -> dict[str, Any]:
     if os.environ.get("CONTENT_FACTORY_ARTICLE_GENERATOR"):
         return run_external_article_generator(prompt, output_dir)
-    return run_openrouter_article_generator(prompt, model)
+    raise PipelineError(
+        "codex_article_required: article.md, brief.md, cover-prompt.md, and titles must be written by Codex; "
+        "this skill no longer calls external LLM APIs for article generation."
+    )
 
 
 def article_char_count(article: str) -> int:
@@ -430,7 +390,54 @@ def validate_article(article: str, *, min_chars: int = 1100, max_chars: int = 13
         raise PipelineError(f"article length out of range: {count} chars, expected {min_chars}-{max_chars}.")
 
 
-def ensure_required_payload(payload: dict[str, Any]) -> dict[str, str]:
+def validate_title_payload(titles: Any) -> dict[str, Any]:
+    if titles is None:
+        return {}
+    if not isinstance(titles, dict):
+        raise PipelineError("titles must be an object when provided.")
+    pain_point = titles.get("pain_point")
+    cognitive_gap = titles.get("cognitive_gap")
+    recommended = titles.get("recommended")
+    if not isinstance(pain_point, list) or len([item for item in pain_point if str(item).strip()]) != 5:
+        raise PipelineError("titles.pain_point must contain exactly 5 titles.")
+    if not isinstance(cognitive_gap, list) or len([item for item in cognitive_gap if str(item).strip()]) != 5:
+        raise PipelineError("titles.cognitive_gap must contain exactly 5 titles.")
+    if not isinstance(recommended, dict):
+        raise PipelineError("titles.recommended is missing.")
+    for key in ["primary", "secondary", "reason"]:
+        if not str(recommended.get(key) or "").strip():
+            raise PipelineError(f"titles.recommended.{key} is missing.")
+    return titles
+
+
+def write_titles_markdown(output_dir: Path, titles: dict[str, Any]) -> Path:
+    path = output_dir / "titles.md"
+    lines = [
+        "# 标题候选",
+        "",
+        "## 击中痛点型",
+        "",
+    ]
+    lines.extend(f"{index}. {title}" for index, title in enumerate(titles["pain_point"], 1))
+    lines.extend(["", "## 认知差型", ""])
+    lines.extend(f"{index}. {title}" for index, title in enumerate(titles["cognitive_gap"], 1))
+    recommended = titles["recommended"]
+    lines.extend(
+        [
+            "",
+            "## 推荐首选",
+            "",
+            f"- 首选标题：{recommended['primary']}",
+            f"- 备选标题：{recommended['secondary']}",
+            f"- 推荐理由：{recommended['reason']}",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def ensure_required_payload(payload: dict[str, Any]) -> dict[str, Any]:
     title = str(payload.get("title") or "").strip()
     article = str(payload.get("article") or "").strip()
     brief = str(payload.get("brief") or "").strip()
@@ -449,7 +456,14 @@ def ensure_required_payload(payload: dict[str, Any]) -> dict[str, str]:
     if not cover_prompt:
         cover_prompt = fallback_cover_prompt(title)
     validate_article(article)
-    return {"title": title, "article": article + "\n", "brief": brief + "\n", "coverPrompt": cover_prompt + "\n"}
+    titles = validate_title_payload(payload.get("titles"))
+    return {
+        "title": title,
+        "article": article + "\n",
+        "brief": brief + "\n",
+        "coverPrompt": cover_prompt + "\n",
+        "titles": titles,
+    }
 
 
 def first_markdown_title(article: str) -> str:
@@ -557,6 +571,10 @@ def write_output_files(
             }
         },
     }
+    if payload.get("titles"):
+        write_titles_markdown(output_dir, payload["titles"])
+        metadata["titles"] = payload["titles"]
+
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return metadata_path
@@ -621,10 +639,6 @@ def run_cover_generation(output_dir: Path, args: argparse.Namespace) -> dict[str
 
 def run_title_generation(output_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     command = ["python3", str(TITLE_SCRIPT), str(output_dir)]
-    if args.env_file:
-        command += ["--env-file", args.env_file]
-    if args.text_model:
-        command += ["--model", args.text_model]
     try:
         result = subprocess.run(
             command,
@@ -660,6 +674,13 @@ def run_title_generation(output_dir: Path, args: argparse.Namespace) -> dict[str
         timeout_seconds=TITLE_SCRIPT_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
+        try:
+            payload = json.loads(result.stdout)
+            failures = payload.get("failures") or []
+            if failures and failures[0].get("status") == "codex_title_required":
+                raise PipelineError(f"codex_title_required: {failures[0].get('error', '')}")
+        except json.JSONDecodeError:
+            pass
         message = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise PipelineError(f"title_generation_failed: {message}")
     try:
@@ -808,7 +829,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     try:
         title_result = run_title_generation(output_dir, args)
     except Exception as exc:
-        message = f"title_generation_failed: {exc}"
+        is_codex_title_required = "codex_title_required" in str(exc)
+        message = str(exc) if is_codex_title_required else f"title_generation_failed: {exc}"
         mark_source(vault, source_id, status="failed", output_dir=output_dir, profile_id=profile_id, corpus_id=corpus_id, note=message)
         write_pipeline_summary(
             output_dir,
@@ -816,7 +838,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             source_status="failed",
             normalized_path=str(normalized_path),
             article_status="generated",
-            titles_status="failed",
+            titles_status=("codex_title_required" if is_codex_title_required else "failed"),
             cover_status="not_run",
             error=message,
         )
@@ -864,7 +886,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", default=str(DEFAULT_PROFILE))
     parser.add_argument("--corpus", default=str(DEFAULT_CORPUS))
     parser.add_argument("--env-file", default="")
-    parser.add_argument("--text-model", default=os.environ.get("OPENROUTER_MODEL", ""))
+    parser.add_argument("--text-model", default="", help="Deprecated; external LLM article generation is disabled.")
     parser.add_argument("--article-attempts", type=int, default=5)
     parser.add_argument("--cover-provider", default="codex-imagegen")
     parser.add_argument("--cover-model", default="")
