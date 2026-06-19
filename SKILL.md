@@ -543,6 +543,18 @@ Candidate rules:
 - If `--allow-title-fallback` is passed for compatibility, fallback output still cannot become publish-ready; it must stop as `needs_manual_title_review`.
 - When Codex-authored title or article work is needed, write it directly into the output directory first, then rerun the pipeline.
 
+Inspect diagnostics:
+
+- `inspect` is a pure read-only diagnostic mode, but it must still output readiness gaps and Codex tasks.
+- Missing `article.md` is `codex_article_required`.
+- Missing `images/cover.png` is `codex_image_required`.
+- Missing or incomplete `titles.md` / `metadata.json.titles` is `codex_title_required`.
+- Missing `metadata.json.quality.status` is `quality_check_required`.
+- `quality.status = needs_revision` or another non-ready value is `quality_revision_required`.
+- Ready quality with missing `feishu-publish.md` is `feishu_publish_required`.
+- Complete local publish state is `ready_for_guarded_dry_run`.
+- `inspect` must not automatically fix any issue; it only reports `codexRequiredTasks`, `qualityRequired`, `revisionRequired`, `feishuPublishRequired`, `readyForPrepare`, `readyForGuardedDryRun`, `riskExcluded`, `blocked`, and `allUnpublishedDiagnostics`.
+
 ## Feishu Review Status
 
 Use this after a Feishu document has been published to record manual review and downstream WeChat handling status.

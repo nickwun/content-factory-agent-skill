@@ -186,6 +186,83 @@ def titles_structurally_ready(metadata: dict[str, Any], output_dir: Path) -> boo
     )
 
 
+def title_state_ready(metadata: dict[str, Any], output_dir: Path) -> bool:
+    return titles_structurally_ready(metadata, output_dir)
+
+
+def inspect_diagnostic(output_dir: Path, metadata: dict[str, Any], blocked: dict[str, str], *, include_risky: bool) -> dict[str, Any]:
+    feishu = get_feishu(metadata)
+    quality = metadata.get("quality") if isinstance(metadata.get("quality"), dict) else {}
+    quality_status = str(quality.get("status") or "")
+    article_exists = (output_dir / "article.md").is_file()
+    cover_exists = (output_dir / "images" / "cover.png").is_file()
+    titles_md_exists = (output_dir / "titles.md").is_file()
+    metadata_titles_exists = isinstance(metadata.get("titles"), dict)
+    titles_ready = title_state_ready(metadata, output_dir)
+    feishu_publish_exists = (output_dir / "feishu-publish.md").is_file()
+    document_url = str(feishu.get("documentUrl") or "")
+    publish_status = str(feishu.get("status") or "")
+    requires_remote_check = bool(feishu.get("requiresRemoteCheck") or feishu.get("requires_remote_check"))
+    historical_block_path = blocked.get(output_dir.name, "")
+    risk = risk_reason(output_dir) if not include_risky else ""
+    missing: list[str] = []
+    suggested_action = ""
+
+    if publish_status == "published" or document_url:
+        status = "already_published"
+    elif requires_remote_check:
+        status = "requires_remote_check"
+    elif historical_block_path:
+        status = "historically_blocked"
+    elif risk:
+        status = "risk_excluded"
+    elif not article_exists:
+        status = "codex_article_required"
+        missing = ["article.md"]
+        suggested_action = "Codex should write article.md before prepare."
+    elif not cover_exists:
+        status = "codex_image_required"
+        missing = ["images/cover.png"]
+        suggested_action = "Codex image generation should create images/cover.png before prepare."
+    elif not titles_ready:
+        status = "codex_title_required"
+        if not titles_md_exists:
+            missing.append("titles.md")
+        if not metadata_titles_exists:
+            missing.append("metadata.titles")
+        if not missing:
+            missing = ["valid titles.md", "valid metadata.titles"]
+        suggested_action = "Codex should write titles.md and metadata.titles before prepare."
+    elif not quality_status:
+        status = "quality_check_required"
+    elif quality_status not in READY_QUALITY_STATUSES:
+        status = "quality_revision_required"
+    elif not feishu_publish_exists:
+        status = "feishu_publish_required"
+    else:
+        status = "ready_for_guarded_dry_run"
+
+    return {
+        "slug": output_dir.name,
+        "path": str(output_dir),
+        "outputDir": str(output_dir),
+        "status": status,
+        "missing": missing,
+        "suggestedAction": suggested_action,
+        "articleExists": article_exists,
+        "coverExists": cover_exists,
+        "titlesMdExists": titles_md_exists,
+        "metadataTitlesExists": metadata_titles_exists,
+        "qualityStatus": quality_status,
+        "feishuPublishExists": feishu_publish_exists,
+        "publishFeishuStatus": publish_status,
+        "documentUrl": document_url,
+        "requiresRemoteCheck": requires_remote_check,
+        "historicalBlockPath": historical_block_path,
+        "riskReason": risk,
+    }
+
+
 def title_consistency_ok(article: str, metadata: dict[str, Any]) -> bool:
     titles = metadata.get("titles") if isinstance(metadata.get("titles"), dict) else {}
     recommended = titles.get("recommended") if isinstance(titles.get("recommended"), dict) else {}
@@ -310,6 +387,19 @@ def write_codex_required_tasks(run_dir: Path, tasks: list[dict[str, Any]]) -> st
     return str(path)
 
 
+def codex_task_from_diagnostic(item: dict[str, Any]) -> dict[str, Any]:
+    required = item.get("missing") if isinstance(item.get("missing"), list) else []
+    return {
+        "slug": item["slug"],
+        "path": item["path"],
+        "outputDir": item["outputDir"],
+        "required": required,
+        "status": item["status"],
+        "suggestedAction": item.get("suggestedAction") or "Codex should complete the missing content before prepare.",
+        "tasks": required,
+    }
+
+
 def batch_dry_run(root: Path, outputs: list[Path], run_id: str, allow_permission_skip: bool) -> dict[str, Any]:
     if not outputs:
         return {"selectedCount": 0, "results": [], "statePath": "", "summaryPath": ""}
@@ -360,9 +450,49 @@ def run_release(args: argparse.Namespace) -> dict[str, Any]:
     candidates: list[dict[str, str]] = []
     prepared: list[dict[str, str]] = []
     codex_tasks: list[dict[str, Any]] = []
+    risk_excluded: list[dict[str, Any]] = []
+    quality_required: list[dict[str, Any]] = []
+    revision_required: list[dict[str, Any]] = []
+    feishu_publish_required: list[dict[str, Any]] = []
+    ready_for_prepare: list[dict[str, Any]] = []
+    ready_for_guarded_dry_run: list[dict[str, Any]] = []
+    blocked_items: list[dict[str, Any]] = []
+    all_unpublished_diagnostics: list[dict[str, Any]] = []
+    published_count = 0
 
     for output in outputs:
         metadata = load_json(output / "metadata.json")
+        if args.mode == "inspect":
+            diagnostic = inspect_diagnostic(output, metadata, blocked, include_risky=args.include_risky)
+            status = diagnostic["status"]
+            if status == "already_published":
+                published_count += 1
+                skipped.append({"slug": output.name, "outputDir": str(output), "reason": status})
+                continue
+            all_unpublished_diagnostics.append(diagnostic)
+            reason = basic_skip_reason(output, metadata, blocked, include_risky=args.include_risky)
+            if not reason:
+                candidates.append({"slug": output.name, "outputDir": str(output)})
+            else:
+                skipped.append({"slug": output.name, "outputDir": str(output), "reason": status})
+            if status in {"codex_article_required", "codex_image_required", "codex_title_required"}:
+                codex_tasks.append(codex_task_from_diagnostic(diagnostic))
+            elif status == "quality_check_required":
+                quality_required.append(diagnostic)
+            elif status == "quality_revision_required":
+                revision_required.append(diagnostic)
+            elif status == "feishu_publish_required":
+                feishu_publish_required.append(diagnostic)
+                ready_for_prepare.append(diagnostic)
+            elif status == "ready_for_guarded_dry_run":
+                ready_for_guarded_dry_run.append(diagnostic)
+            elif status == "risk_excluded":
+                risk_excluded.append(diagnostic)
+                risks.append({"slug": output.name, "outputDir": str(output), "reason": status})
+            elif status in {"requires_remote_check", "historically_blocked"}:
+                blocked_items.append(diagnostic)
+            continue
+
         reason = basic_skip_reason(output, metadata, blocked, include_risky=args.include_risky)
         if reason:
             item = {"slug": output.name, "outputDir": str(output), "reason": reason}
@@ -426,12 +556,23 @@ def run_release(args: argparse.Namespace) -> dict[str, Any]:
         "root": str(root),
         "runId": run_id,
         "mode": args.mode,
+        "totalCount": len(outputs),
+        "publishedCount": published_count if args.mode == "inspect" else 0,
+        "unpublishedCount": len(all_unpublished_diagnostics) if args.mode == "inspect" else 0,
         "selectedCount": len(selected_paths),
         "candidates": candidates,
         "skipped": skipped,
         "prepared": prepared,
         "risks": risks,
         "codexRequiredTasks": codex_tasks,
+        "qualityRequired": quality_required,
+        "revisionRequired": revision_required,
+        "feishuPublishRequired": feishu_publish_required,
+        "readyForPrepare": ready_for_prepare,
+        "readyForGuardedDryRun": ready_for_guarded_dry_run,
+        "riskExcluded": risk_excluded,
+        "blocked": blocked_items,
+        "allUnpublishedDiagnostics": all_unpublished_diagnostics,
         "batchDryRun": batch_result,
         "guardedPublishCommand": guarded_publish_command,
         "paths": paths,

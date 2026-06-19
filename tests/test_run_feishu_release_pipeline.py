@@ -167,8 +167,15 @@ class RunFeishuReleasePipelineTest(unittest.TestCase):
             env=env,
         )
 
+    def diagnostic_for(self, payload: dict, slug: str) -> dict:
+        for item in payload["allUnpublishedDiagnostics"]:
+            if item["slug"] == slug:
+                return item
+        self.fail(f"missing diagnostic for {slug}")
+
     def test_inspect_scans_without_writing_vault_or_building(self) -> None:
         ready = self.write_output("2026-06-19-running-social-quiet")
+        (ready / "feishu-publish.md").write_text("# Feishu\n", encoding="utf-8")
         before_files = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
 
         result = self.run_script("--mode", "inspect")
@@ -177,9 +184,85 @@ class RunFeishuReleasePipelineTest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["mode"], "inspect")
         self.assertEqual([Path(item["outputDir"]).name for item in payload["candidates"]], [ready.name])
+        self.assertEqual(payload["totalCount"], 1)
+        self.assertEqual(payload["publishedCount"], 0)
+        self.assertEqual(payload["unpublishedCount"], 1)
+        self.assertEqual([item["slug"] for item in payload["readyForGuardedDryRun"]], [ready.name])
+        self.assertEqual(self.diagnostic_for(payload, ready.name)["status"], "ready_for_guarded_dry_run")
         self.assertEqual(payload["prepared"], [])
         self.assertEqual(payload["paths"]["runState"], "")
-        self.assertFalse((ready / "feishu-publish.md").exists())
+        after_files = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
+        self.assertEqual(before_files, after_files)
+
+    def test_inspect_reports_readiness_gaps_without_side_effects(self) -> None:
+        missing_titles = self.write_output("2026-06-19-missing-titles", titles=None)
+        missing_quality = self.write_output("2026-06-19-missing-quality", quality_status=None)
+        missing_article = self.write_output("2026-06-19-missing-article")
+        (missing_article / "article.md").unlink()
+        missing_cover = self.write_output("2026-06-19-missing-cover", cover=False)
+        missing_feishu = self.write_output("2026-06-19-missing-feishu")
+        ready = self.write_output("2026-06-19-ready-guarded")
+        (ready / "feishu-publish.md").write_text("# Feishu\n", encoding="utf-8")
+        revision = self.write_output("2026-06-19-needs-revision", quality_status="needs_revision")
+        risky = self.write_output("2026-06-19-heart-risk-story")
+        published = self.write_output("2026-06-19-published", published=True)
+        remote = self.write_output("2026-06-19-remote-check", requires_remote_check=True)
+        blocked = self.write_output("2026-06-19-historical-blocked")
+        run_dir = self.root / "batch-runs" / "old-run"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "articles": {
+                        blocked.name: {
+                            "current_stage": "blocked_remote_check",
+                            "requires_remote_check": True,
+                            "skipped_reason": "requires_remote_check",
+                        }
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        before_files = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
+        env = os.environ.copy()
+        env["OPENROUTER_API_KEY"] = "must-not-be-used"
+
+        result = self.run_script("--mode", "inspect", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["totalCount"], 11)
+        self.assertEqual(payload["publishedCount"], 1)
+        self.assertEqual(payload["unpublishedCount"], 10)
+        self.assertEqual(self.diagnostic_for(payload, missing_titles.name)["status"], "codex_title_required")
+        self.assertEqual(self.diagnostic_for(payload, missing_quality.name)["status"], "quality_check_required")
+        self.assertEqual(self.diagnostic_for(payload, missing_article.name)["status"], "codex_article_required")
+        self.assertEqual(self.diagnostic_for(payload, missing_cover.name)["status"], "codex_image_required")
+        self.assertEqual(self.diagnostic_for(payload, missing_feishu.name)["status"], "feishu_publish_required")
+        self.assertEqual(self.diagnostic_for(payload, ready.name)["status"], "ready_for_guarded_dry_run")
+        self.assertEqual(self.diagnostic_for(payload, revision.name)["status"], "quality_revision_required")
+        self.assertEqual(self.diagnostic_for(payload, risky.name)["status"], "risk_excluded")
+        self.assertEqual(self.diagnostic_for(payload, remote.name)["status"], "requires_remote_check")
+        self.assertEqual(self.diagnostic_for(payload, blocked.name)["status"], "historically_blocked")
+        self.assertCountEqual(
+            [item["slug"] for item in payload["codexRequiredTasks"]],
+            [missing_titles.name, missing_article.name, missing_cover.name],
+        )
+        self.assertEqual([item["slug"] for item in payload["qualityRequired"]], [missing_quality.name])
+        self.assertEqual([item["slug"] for item in payload["revisionRequired"]], [revision.name])
+        self.assertEqual([item["slug"] for item in payload["feishuPublishRequired"]], [missing_feishu.name])
+        self.assertEqual([item["slug"] for item in payload["readyForPrepare"]], [missing_feishu.name])
+        self.assertEqual([item["slug"] for item in payload["readyForGuardedDryRun"]], [ready.name])
+        self.assertEqual([item["slug"] for item in payload["riskExcluded"]], [risky.name])
+        self.assertEqual({item["slug"] for item in payload["blocked"]}, {remote.name, blocked.name})
+        self.assertEqual(payload["batchDryRun"]["selectedCount"], 0)
+        self.assertEqual(payload["paths"]["runState"], "")
+        self.assertEqual(payload["paths"]["summary"], "")
+        self.assertEqual(payload["paths"]["backupManifest"], "")
+        self.assertFalse((self.root / "batch-runs" / "test-release").exists())
+        self.assertFalse(any(path.name.startswith("generate_titles") for path in self.root.rglob("*")))
         after_files = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*") if path.is_file())
         self.assertEqual(before_files, after_files)
 
